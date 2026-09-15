@@ -1,8 +1,8 @@
 @echo off
-title DataX Migration Studio
+title Datax Migration Studio
 
 echo ================================================================
-echo            Iniciando DataX Migration Studio (Web)
+echo            Iniciando Datax Migration Studio (Web)
 echo ================================================================
 echo.
 

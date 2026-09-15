@@ -1,4 +1,4 @@
-# 🚀 DataX Migration Studio (Web)
+# 🚀 Datax Migration Studio (Web)
 
 Plataforma Web gráfica desarrollada en **Streamlit** para migrar robots de **Descarga (`D_...`)** y **Conversión (`C_...`)** desde la versión antigua (V1) a la **Plataforma V2** (Airflow 3, PostgreSQL 17).
 
