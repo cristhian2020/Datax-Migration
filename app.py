@@ -3,6 +3,7 @@
 import os
 import sys
 import streamlit as st
+import pandas as pd
 
 # Setup paths
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,7 +18,15 @@ from core.config import (
     DEFAULT_DB_USER,
     DEFAULT_DB_PASS,
     DEFAULT_DB_NAME,
+    DEFAULT_GITHUB_REPO,
+    DEFAULT_GITHUB_TOKEN,
     get_engine,
+)
+from core.github_client import (
+    test_github_access,
+    list_pull_requests,
+    get_pr_files,
+    download_github_file,
 )
 from core.migrator_download import (
     scan_old_download_robots,
@@ -75,6 +84,48 @@ try:
     st.sidebar.success("🟢 Conexión a platform_db Activa")
 except Exception as e:
     st.sidebar.warning("🔴 Sin conexión a platform_db (Offline)")
+
+with st.sidebar.expander("🐙 Conexión GitHub (Pasantes)", expanded=False):
+    gh_repo = st.text_input("Repositorio (owner/repo):", value=DEFAULT_GITHUB_REPO, key="sidebar_gh_repo")
+    gh_token = st.text_input(
+        "GitHub Token (PAT):",
+        value=st.session_state.get("github_token", DEFAULT_GITHUB_TOKEN),
+        type="password",
+        help="Token con permisos de lectura de repositorios para acceder al repositorio privado de los pasantes.",
+        key="sidebar_gh_token"
+    )
+    st.session_state["github_repo"] = gh_repo
+    st.session_state["github_token"] = gh_token
+
+    col_ght1, col_ght2 = st.columns(2)
+    with col_ght1:
+        if st.button("🔌 Probar", key="btn_test_gh_conn"):
+            if not gh_token:
+                st.warning("Ingresa un token PAT.")
+            else:
+                with st.spinner("Conectando con GitHub..."):
+                    ok_gh, msg_gh, _ = test_github_access(gh_token, gh_repo)
+                if ok_gh:
+                    st.success(msg_gh)
+                else:
+                    st.error(msg_gh)
+    with col_ght2:
+        if st.button("💾 Guardar .env", key="btn_save_gh_env"):
+            try:
+                env_path = os.path.join(CURRENT_DIR, ".env")
+                env_lines = []
+                if os.path.isfile(env_path):
+                    with open(env_path, "r", encoding="utf-8") as fe:
+                        for l in fe.readlines():
+                            if not l.startswith("GITHUB_TOKEN=") and not l.startswith("GITHUB_REPO="):
+                                env_lines.append(l)
+                env_lines.append(f"GITHUB_REPO={gh_repo}\n")
+                env_lines.append(f"GITHUB_TOKEN={gh_token}\n")
+                with open(env_path, "w", encoding="utf-8") as fe:
+                    fe.writelines(env_lines)
+                st.success("Guardado en .env")
+            except Exception as ex:
+                st.error(f"Error: {ex}")
 
 mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "📊 Migración por Lote", "☁️ Despliegue al Servidor"])
 
@@ -276,10 +327,16 @@ elif mode == "🔄 Robots de Conversión":
 
         # Código original vs V2
         st.markdown("#### 💻 Origen del Código del Robot")
-        default_src_idx = 2 if sel_mode.startswith("✍️") else 0
+        source_options = [
+            "🐙 Cargar desde Pull Request de GitHub (Pasantes)",
+            "📋 Pegar código del freelancer directamente",
+            "📤 Subir archivo .py (descargado de GitHub)",
+            "📁 Archivo detectado en la carpeta / repositorio local"
+        ]
+        default_src_idx = 0 if sel_mode.startswith("✍️") else 3
         source_mode = st.radio(
             "¿De dónde deseas obtener el código de este robot?",
-            ["📁 Archivo detectado en la carpeta / repositorio local", "📤 Subir archivo .py (descargado de GitHub)", "📋 Pegar código del freelancer directamente"],
+            source_options,
             index=default_src_idx,
             horizontal=True,
             key=f"src_mode_{rep_choice}"
@@ -288,7 +345,105 @@ elif mode == "🔄 Robots de Conversión":
         raw_conv_code = ""
         chosen_rep_data = next((r for r in selected_fam["sub_reports"] if r["code"] == rep_choice), None)
 
-        if source_mode == "📁 Archivo detectado en la carpeta / repositorio local":
+        if source_mode == "🐙 Cargar desde Pull Request de GitHub (Pasantes)":
+            active_gh_token = st.session_state.get("github_token", DEFAULT_GITHUB_TOKEN)
+            active_gh_repo = st.session_state.get("github_repo", DEFAULT_GITHUB_REPO)
+
+            if not active_gh_token:
+                st.warning("⚠️ No se ha configurado un GitHub Token (PAT). Por favor ingrésalo en la barra lateral en la sección '🐙 Conexión GitHub (Pasantes)'.")
+            else:
+                col_pr1, col_pr2 = st.columns([3, 1])
+                with col_pr1:
+                    pr_search_q = st.text_input("Filtrar Pull Requests por código / palabra clave:", value=rep_choice, key=f"pr_q_{rep_choice}")
+                with col_pr2:
+                    st.write("")
+                    st.write("")
+                    st.button("🔄 Refrescar PRs", key=f"btn_ref_prs_{rep_choice}")
+
+                with st.spinner(f"Consultando Pull Requests en {active_gh_repo}..."):
+                    prs_found = list_pull_requests(active_gh_token, active_gh_repo, state="open", search_query=pr_search_q)
+
+                if not prs_found:
+                    st.info(f"No se encontraron Pull Requests abiertos que coincidan con '{pr_search_q}' en `{active_gh_repo}`.")
+                else:
+                    pr_labels = []
+                    for p in prs_found:
+                        prefix = "⭐ Coincide: " if p["matched"] else ""
+                        pr_labels.append(f"{prefix}PR #{p['number']}: {p['title']} (por @{p['author']})")
+
+                    sel_pr_idx = st.selectbox(
+                        "Selecciona el Pull Request del pasante:",
+                        range(len(pr_labels)),
+                        format_func=lambda i: pr_labels[i],
+                        key=f"sel_pr_item_{rep_choice}"
+                    )
+                    chosen_pr = prs_found[sel_pr_idx]
+                    st.caption(f"🌿 Rama: `{chosen_pr['branch']}` | 🔗 Enlace: [{chosen_pr['title']}]({chosen_pr['html_url']})")
+
+                    # Archivos en el PR
+                    with st.spinner(f"Obteniendo archivos del PR #{chosen_pr['number']}..."):
+                        pr_files = get_pr_files(active_gh_token, active_gh_repo, chosen_pr["number"])
+
+                    py_files = [f for f in pr_files if f["is_py"]]
+                    sample_files = [f for f in pr_files if f["is_sample"]]
+
+                    if py_files:
+                        py_names = [f["filename"] for f in py_files]
+                        best_idx = 0
+                        for idx_p, pf in enumerate(py_files):
+                            if rep_choice.lower() in pf["filename"].lower() or selected_parent.lower() in pf["filename"].lower():
+                                best_idx = idx_p
+                                break
+
+                        col_sel_py, col_btn_load = st.columns([3, 1])
+                        with col_sel_py:
+                            sel_py_file = st.selectbox("Script .py en el PR:", py_names, index=best_idx, key=f"py_sel_{chosen_pr['number']}_{rep_choice}")
+                        with col_btn_load:
+                            st.write("")
+                            st.write("")
+                            load_py_clicked = st.button("📥 Cargar al Editor", type="primary", key=f"btn_dl_code_{chosen_pr['number']}")
+
+                        chosen_py_obj = next(f for f in py_files if f["filename"] == sel_py_file)
+
+                        # Auto-cargar si se presionó el botón o si ya estaba cargado en session_state
+                        if load_py_clicked:
+                            with st.spinner("Descargando script desde GitHub..."):
+                                downloaded_bytes = download_github_file(active_gh_token, chosen_py_obj["raw_url"], chosen_py_obj["contents_url"])
+                                if downloaded_bytes:
+                                    raw_conv_code = downloaded_bytes.decode("utf-8", errors="ignore")
+                                    st.session_state[f"gh_code_{rep_choice}"] = raw_conv_code
+                                    st.success(f"✅ Código de `{os.path.basename(sel_py_file)}` cargado exitosamente.")
+                                else:
+                                    st.error("❌ No se pudo descargar el archivo de GitHub.")
+                        elif f"gh_code_{rep_choice}" in st.session_state:
+                            raw_conv_code = st.session_state[f"gh_code_{rep_choice}"]
+                        else:
+                            st.info(f"Haz clic en '📥 Cargar al Editor' para traer el código de `{os.path.basename(sel_py_file)}`.")
+                    else:
+                        st.warning(f"No se detectaron scripts `.py` en el PR #{chosen_pr['number']}.")
+
+                    # Detección y descarga de muestras si existen en el PR
+                    if sample_files:
+                        st.markdown("##### 📁 Archivo(s) de muestra detectado(s) en este PR")
+                        for sf in sample_files:
+                            c_sf1, c_sf2 = st.columns([3, 1])
+                            sf_base = os.path.basename(sf["filename"])
+                            c_sf1.write(f"📄 `{sf['filename']}` ({sf['status']})")
+                            if c_sf2.button(f"⬇️ Descargar {sf_base}", key=f"dl_sf_{chosen_pr['number']}_{sf_base}"):
+                                dest_parent_dir = os.path.join(new_repo, "models", "conversion", selected_parent)
+                                os.makedirs(dest_parent_dir, exist_ok=True)
+                                target_sample_loc = os.path.join(dest_parent_dir, sf_base)
+                                with st.spinner(f"Descargando {sf_base}..."):
+                                    sample_bytes = download_github_file(active_gh_token, sf["raw_url"], sf["contents_url"])
+                                    if sample_bytes:
+                                        with open(target_sample_loc, "wb") as f_samp:
+                                            f_samp.write(sample_bytes)
+                                        st.session_state[f"sample_file_{rep_choice}"] = target_sample_loc
+                                        st.success(f"✅ Muestra guardada en `{target_sample_loc}` y activa para pruebas!")
+                                    else:
+                                        st.error("No se pudo descargar la muestra de GitHub.")
+
+        elif source_mode == "📁 Archivo detectado en la carpeta / repositorio local":
             if chosen_rep_data and chosen_rep_data.get("file") and os.path.isfile(chosen_rep_data["file"]):
                 with open(chosen_rep_data["file"], "r", encoding="utf-8", errors="ignore") as f:
                     raw_conv_code = f.read()
