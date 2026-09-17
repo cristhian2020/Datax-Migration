@@ -280,7 +280,7 @@ def setup_columns_to_review(sqlite_path: str, report_code: str) -> Tuple[bool, L
         review_cols = []
         for col in all_cols:
             c_low = col.strip().lower()
-            if c_low in ("valor", "file") or c_low.startswith(("titulo", "id_")):
+            if c_low in ("valor", "file", "fecha") or c_low.startswith(("titulo", "id_")):
                 continue
             review_cols.append(col)
 

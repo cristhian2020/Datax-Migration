@@ -628,7 +628,7 @@ elif mode == "🔄 Robots de Conversión":
         Según el **Paso 8** del manual:
         - La tabla interna del SQLite debe llamarse **`columns_to_review`**.
         - La columna debe llamarse **`column`**.
-        - **SOLO** debe incluir niveles (`fecha`, `nv1`, `nv2`, ..., `nvX`).
+        - **SOLO** debe incluir niveles jerárquicos (`nv1`, `nv2`, ..., `nvX`). Excluye `fecha` si el reporte tiene fechas anuales/discontinuas.
         - 🚫 **NUNCA** incluir `valor` ni metadatos (`file`, `tituloX`).
         """)
 
