@@ -92,9 +92,23 @@ def refactor_conversion_code(raw_code: str, report_code: str) -> str:
     code_content = re.sub(r"\bfrom\s+download_tools\b", "from models.download.tools.download_tools", code_content)
     code_content = re.sub(r"\bimport\s+download_tools\b", "import models.download.tools.download_tools as download_tools", code_content)
 
-    # 3. Asegurar import requerido de Conversion_Base
-    if "from models.conversion.Conversion_Base import Conversion_Base" not in code_content:
-        code_content = "from models.conversion.Conversion_Base import Conversion_Base\n" + code_content
+    # 3. Limpiar cualquier import previo o try/except obsoleto de Conversion_Base
+    # a) Eliminar bloques try/except obsoletos de la vieja fábrica
+    code_content = re.sub(
+        r"try:\s*\n\s*from\s+models\.conversion(?:\.Conversion_Base)?\s+import\s+Conversion_Base\s*\nexcept[^\n]*:.*?(?=\n\S|\Z)",
+        "",
+        code_content,
+        flags=re.DOTALL
+    )
+    # b) Eliminar imports sueltos previos (incluyendo el erróneo 'from models.conversion import Conversion_Base')
+    code_content = re.sub(
+        r"^[ \t]*from\s+models\.conversion(?:\.Conversion_Base)?\s+import\s+Conversion_Base[^\n]*\n?",
+        "",
+        code_content,
+        flags=re.MULTILINE
+    )
+    # c) Asegurar un único import oficial y limpio al inicio del archivo
+    code_content = "from models.conversion.Conversion_Base import Conversion_Base\n" + code_content.lstrip()
 
     # 4. Renombrar clase principal a <REPORT_CODE>(Conversion_Base)
     # Soporta class Robot:, class Robot():, class Robot(Conversion_Base):, class Executor_...:, etc.
@@ -353,3 +367,31 @@ def apply_conversion_migration(
         return {"success": success, "logs": logs}
     except Exception as exc:
         return {"success": False, "logs": [f"Error general: {exc}"]}
+
+
+def get_latest_download_for_report(report_code: str, engine) -> Optional[Dict]:
+    """Obtiene la última descarga registrada para este reporte en platform_db con su archivo Excel."""
+    query = f"""
+        SELECT d.id_download, d.path, d.downloaded_to
+        FROM report r
+        JOIN download d ON r.id_file = d.id_file
+        WHERE r.code = '{report_code}'
+        ORDER BY d.id_download DESC
+        LIMIT 1;
+    """
+    try:
+        df = pd.read_sql_query(query, con=engine)
+        if df.empty:
+            return None
+        row = df.iloc[0].to_dict()
+        paths = [p.strip() for p in str(row.get("path", "")).split(";") if p.strip()]
+        excel_paths = [p for p in paths if p.lower().endswith((".xls", ".xlsx"))]
+        best_file = excel_paths[0] if excel_paths else (paths[0] if paths else "")
+        return {
+            "id_download": int(row["id_download"]),
+            "file": best_file,
+            "downloaded_to": str(row.get("downloaded_to", "")),
+            "all_paths": paths
+        }
+    except Exception as exc:
+        return None

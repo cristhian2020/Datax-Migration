@@ -45,6 +45,7 @@ from core.migrator_conversion import (
     get_replacement_table_data,
     setup_columns_to_review,
     apply_conversion_migration,
+    get_latest_download_for_report,
 )
 from core.deployer import (
     test_connection,
@@ -709,12 +710,21 @@ elif mode == "🔄 Robots de Conversión":
         st.markdown("#### 🎯 Probar Ejecución del DAG en Airflow (Trigger Remoto)")
         st.caption("Ejecuta el comando `airflow dags trigger` dentro del contenedor worker de Airflow con los parámetros de prueba.")
 
+                # Autocompletado inteligente desde platform_db
+        auto_dl = get_latest_download_for_report(rep_choice, engine)
+        if auto_dl:
+            st.info(f"🎯 **Última descarga detectada automáticamente:** ID `{auto_dl['id_download']}` (Corte: `{auto_dl['downloaded_to']}`)")
+            default_id_dl = auto_dl["id_download"]
+            default_file_dl = auto_dl["file"]
+        else:
+            default_id_dl = 1
+            default_file_dl = os.path.join(r"\\10.0.0.16\downloaded_files\BO", selected_parent.replace("C_", "D_"), "2026")
+
         col_trig1, col_trig2 = st.columns(2)
         with col_trig1:
             trig_code = st.text_input("Código de reporte (--conf 'code'):", value=rep_choice, key=f"trig_code_{rep_choice}")
-            trig_id_dl = st.number_input("ID de descarga (--conf 'id_download'):", value=1, step=1, key=f"trig_iddl_{rep_choice}")
+            trig_id_dl = st.number_input("ID de descarga (--conf 'id_download'):", value=default_id_dl, step=1, key=f"trig_iddl_{rep_choice}")
         with col_trig2:
-            default_file_dl = f"\\\\10.0.0.16\\downloaded_files\\BO\\{selected_parent.replace('C_', 'D_')}\\2026"
             trig_file = st.text_input("Ruta descargada (--conf 'file'):", value=default_file_dl, key=f"trig_file_{rep_choice}")
 
         if st.button(f"🎯 Disparar DAG `{selected_parent}` en Airflow", use_container_width=True):
