@@ -47,7 +47,17 @@ from core.migrator_conversion import (
     apply_conversion_migration,
     get_latest_download_for_report,
 )
+from core.migrator_migration import (
+    scan_conversion_outputs,
+    get_migration_db_info,
+    inspect_sqlite_structure,
+    generate_migration_sql,
+    generate_migration_py,
+    save_migration_files,
+)
+from core.deployer import trigger_dag_on_server
 from core.deployer import (
+    trigger_dag_on_server,
     test_connection,
     list_migrated_robots,
     deploy_robot_to_server,
@@ -77,6 +87,7 @@ with st.sidebar.expander("🗄️ Configuración Base de Datos", expanded=False)
     db_pass = st.text_input("Contraseña", value=DEFAULT_DB_PASS, type="password")
     db_name = st.text_input("Base de datos", value=DEFAULT_DB_NAME)
 
+engine = None
 db_connected = False
 try:
     engine = get_engine(db_host, db_port, db_user, db_pass, db_name)
@@ -84,6 +95,8 @@ try:
         db_connected = True
     st.sidebar.success("🟢 Conexión a platform_db Activa")
 except Exception as e:
+    engine = None
+    db_connected = False
     st.sidebar.warning("🔴 Sin conexión a platform_db (Offline)")
 
 with st.sidebar.expander("🐙 Conexión GitHub (Pasantes)", expanded=False):
@@ -128,7 +141,7 @@ with st.sidebar.expander("🐙 Conexión GitHub (Pasantes)", expanded=False):
             except Exception as ex:
                 st.error(f"Error: {ex}")
 
-mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "📊 Migración por Lote", "☁️ Despliegue al Servidor"])
+mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "🚚 Robots de Migración", "📦 Migración por Lote", "🚀 Despliegue al Servidor"])
 
 # ─── PESTAÑA 1: DESCARGA ───────────────────────────────────────
 if mode == "📥 Robots de Descarga":
@@ -755,6 +768,176 @@ elif mode == "🔄 Robots de Conversión":
                         st.code(trig_res["output"] or "Sin salida")
 
 # ─── PESTAÑA 3: LOTE ───────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PESTAÑA: MIGRACIÓN A POSTGRESQL (M_...)
+# ═════════════════════════════════════════════════════════════════════════════
+elif "Robots de Migración" in mode:
+    st.header("🚚 Generador y Despliegue de Migración (`M_...` / PostgreSQL)")
+    st.caption("Lee el `.sqlite` generado en Conversión, genera el DDL `.sql` y el robot Python `.py` estandarizado, y despliega automáticamente.")
+
+    conv_families = scan_conversion_outputs(new_repo)
+    if not conv_families:
+        st.warning(f"No se encontraron familias de conversión con archivos `.sqlite` en `{new_repo}/models/conversion`.")
+    else:
+        fam_dict = {f["parent_code"]: f for f in conv_families}
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            sel_parent = st.selectbox("1. Familia de Conversión / Migración:", list(fam_dict.keys()), key="mig_parent_sel")
+        
+        fam_info = fam_dict[sel_parent]
+        reports_in_fam = fam_info["reports"]
+        rep_codes = [r["code"] for r in reports_in_fam]
+
+        with col_m2:
+            sel_report = st.selectbox("2. Reporte a Migrar:", rep_codes, key="mig_report_sel")
+
+        rep_obj = next(r for r in reports_in_fam if r["code"] == sel_report)
+        sqlite_file = rep_obj["sqlite_file"]
+        mig_parent_code = fam_info["migration_parent"]
+
+        db_mig_info = None
+        if db_connected and engine is not None:
+            db_mig_info = get_migration_db_info(sel_report, engine)
+
+        if db_mig_info:
+            st.info(
+                f"📊 **Metadatos en BD:** Nombre: *{db_mig_info.get('name', 'N/A')}* | "
+                f"Storage Table: `{db_mig_info.get('storage_table', 'N/A')}` | "
+                f"Conversion Factor en BD: `{db_mig_info.get('conversion_factor', 'N/A')}` | "
+                f"Decimal Separator: `{db_mig_info.get('decimal_separator', 'N/A')}`"
+            )
+        else:
+            st.caption(f"ℹ️ Archivo SQLite detectado: `{sqlite_file}`")
+
+        struct = inspect_sqlite_structure(sqlite_file, sel_report)
+        
+        tab_cfg, tab_preview, tab_deploy = st.tabs([
+            "⚙️ 1. Configuración & Estructura",
+            "📄 2. Previsualizar Código (.sql & .py)",
+            "🚀 3. Guardar & Desplegar al Servidor"
+        ])
+
+        with tab_cfg:
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                metric_options = ["moneda", "porcentaje", "indice", "volumen", "tasa", "energia", "ratio", "temperatura", "precipitacion"]
+                def_metric_idx = metric_options.index(struct["suggested_metric"]) if struct["suggested_metric"] in metric_options else 0
+                chosen_metric = st.selectbox("Métrica:", metric_options, index=def_metric_idx)
+                
+                chosen_unit = st.text_input("Unidad Métrica:", value=struct["suggested_unit"])
+
+            with col_c2:
+                default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else struct["suggested_factor"]
+                chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0)
+                
+                is_mixed = st.checkbox(
+                    "Reporte con filas híbridas (escalamiento selectivo)",
+                    value=struct["has_mixed_rows"],
+                    help="Si el reporte mezcla montos con porcentajes (%) o ratios, multiplica por el factor únicamente los montos monetarios para proteger las tasas."
+                )
+
+            st.markdown("#### 📋 Columnas Detectadas en SQLite y Estructura de Migración")
+            st.success(f"**Columnas completas para PostgreSQL ({len(struct['all_columns'])}):** `{struct['all_columns']}`")
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.markdown(f"• **Títulos:** `{struct['title_cols']}`")
+                st.markdown(f"• **Jerarquías:** `{struct['nv_cols']}`")
+            with col_s2:
+                st.markdown(f"• **Tiempo y Valor:** `['fecha', 'valor']`")
+                st.markdown(f"• **Columnas de Migración:** `['metrica', 'unidad_metrica']` *(se insertarán antes de `valor`)*")
+            st.caption("ℹ️ *Nota: La columna `file` de SQLite se omite intencionalmente porque solo se usa como referencia local en la conversión y no pertenece a la tabla final de PostgreSQL.*")
+            st.markdown("**Vista Previa de Datos:** *(Desplaza la tabla hacia la derecha para ver todas las columnas)*")
+            st.dataframe(struct["sample_df"], use_container_width=True)
+        sql_code = generate_migration_sql(struct["all_columns"])
+        report_display_name = db_mig_info.get("name") if db_mig_info else struct["titles_text"]
+        py_code = generate_migration_py(
+            report_code=sel_report,
+            report_name=report_display_name,
+            columns=struct["all_columns"],
+            metric=chosen_metric,
+            unit=chosen_unit,
+            factor=chosen_factor,
+            has_mixed_rows=is_mixed
+        )
+
+        with tab_preview:
+            st.subheader(f"📄 Archivos de Migración para `{sel_report}`")
+            col_pr1, col_pr2 = st.columns(2)
+            with col_pr1:
+                st.markdown(f"**DDL SQL:** `{sel_report}.sql`")
+                st.code(sql_code, language="sql")
+            with col_pr2:
+                st.markdown(f"**Robot Python:** `{sel_report}.py`")
+                st.code(py_code, language="python")
+
+        with tab_deploy:
+            st.subheader("💾 Guardado Local y Despliegue")
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                if st.button("💾 Guardar Archivos en models/migration/", type="primary", use_container_width=True):
+                    saved_sql, saved_py = save_migration_files(
+                        repo_path=new_repo,
+                        parent_code=mig_parent_code,
+                        report_code=sel_report,
+                        sql_content=sql_code,
+                        py_content=py_code
+                    )
+                    st.success(f"Archivos guardados exitosamente:\n- `{saved_sql}`\n- `{saved_py}`")
+
+            with col_d2:
+                st.markdown("#### 🚀 Despliegue Rápido por SSH")
+                st.caption(f"Sube `{mig_parent_code}` al servidor, asigna permisos y ejecuta `main-generate.py` opción 3.")
+                mig_ssh_pass = st.text_input("Contraseña SSH (datax-pds):", type="password", key="mig_ssh_pass")
+                
+                if st.button(f"🚀 Desplegar {mig_parent_code} y Generar DAG en Servidor", use_container_width=True):
+                    if not mig_ssh_pass:
+                        st.error("Ingresa la contraseña de SSH para desplegar.")
+                    else:
+                        local_mig_dir = os.path.join(new_repo, "models", "migration", mig_parent_code)
+                        if not os.path.isdir(local_mig_dir):
+                            save_migration_files(new_repo, mig_parent_code, sel_report, sql_code, py_code)
+                        
+                        with st.spinner("Desplegando en el servidor..."):
+                            deploy_res = deploy_robot_to_server(
+                                host="10.0.0.16",
+                                port=22,
+                                username="datax-pds",
+                                password=mig_ssh_pass,
+                                process_type="migration",
+                                robot_code=mig_parent_code,
+                                local_dir=local_mig_dir,
+                                generate_dag=True
+                            )
+                        if deploy_res["success"]:
+                            st.success(f"¡Despliegue y DAG generado exitosamente para `{mig_parent_code}`!")
+                        else:
+                            st.error(f"Error en despliegue: {deploy_res['error']}")
+                        with st.expander("Ver logs de despliegue"):
+                            st.text("\n".join(deploy_res["logs"]))
+
+                st.markdown("---")
+                st.markdown("#### ⚡ Disparar DAG en Airflow")
+                if st.button(f"▶️ Disparar DAG {mig_parent_code} en Airflow", use_container_width=True):
+                    if not mig_ssh_pass:
+                        st.error("Ingresa la contraseña de SSH.")
+                    else:
+                        with st.spinner("Disparando DAG en Airflow worker..."):
+                            trig_ok, trig_log = trigger_dag_on_server(
+                                host="10.0.0.16",
+                                port=22,
+                                username="datax-pds",
+                                password=mig_ssh_pass,
+                                dag_id=mig_parent_code,
+                                report_code=sel_report
+                            )
+                        if trig_ok:
+                            st.success(f"DAG `{mig_parent_code}` disparado exitosamente.")
+                        else:
+                            st.error(f"Fallo al disparar DAG.")
+                        with st.expander("Ver logs de disparo de Airflow", expanded=True):
+                            st.code(trig_log or "Sin salida de terminal.")
+
 elif mode == "📊 Migración por Lote":
     st.header("📊 Migración Masiva por Lote (Batch)")
     st.caption("Migra múltiples robots de descarga o conversión de una sola vez.")
@@ -789,7 +972,7 @@ elif mode == "📊 Migración por Lote":
 
 
 # ─── PESTAÑA 4: DESPLIEGUE AL SERVIDOR ────────────────────────
-elif mode == "☁️ Despliegue al Servidor":
+elif mode == "🚀 Despliegue al Servidor":
     st.header("☁️ Despliegue Automatizado al Servidor Remoto (10.0.0.16)")
     st.caption("Transfiere los robots migrados desde tu máquina al servidor y ejecuta el generador de DAGs en Docker.")
 
@@ -828,8 +1011,13 @@ elif mode == "☁️ Despliegue al Servidor":
 
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        deploy_proc = st.radio("Tipo de Proceso:", ["Descarga (download)", "Conversión (conversion)"], horizontal=True)
-        proc_key = "download" if "Descarga" in deploy_proc else "conversion"
+        deploy_proc = st.radio("Tipo de Proceso:", ["Descarga (download)", "Conversión (conversion)", "Migración (migration)"], horizontal=True)
+        if "Descarga" in deploy_proc:
+            proc_key = "download"
+        elif "Conversión" in deploy_proc:
+            proc_key = "conversion"
+        else:
+            proc_key = "migration"
 
     migrated_list = list_migrated_robots(new_repo, proc_key)
 

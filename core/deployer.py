@@ -44,7 +44,7 @@ def list_migrated_robots(local_repo: str, process_type: str = "download") -> Lis
             continue
         
         # Debe tener formato D_... o C_...
-        if not (entry.startswith("D_") or entry.startswith("C_")):
+        if not (entry.startswith("D_") or entry.startswith("C_") or entry.startswith("M_")):
             continue
 
         files = [f for f in os.listdir(entry_path) if os.path.isfile(os.path.join(entry_path, f))]
@@ -207,7 +207,12 @@ def deploy_robot_to_server(
         dag_generated = False
         if generate_dag:
             log("⚙️ Ejecutando generador de DAGs en Docker...")
-            proc_opt = "1" if process_type == "download" else "2"
+            if process_type == "download":
+                proc_opt = "1"
+            elif process_type == "conversion":
+                proc_opt = "2"
+            else:
+                proc_opt = "3"
             
             # Comando con pipe para responder automáticamente al generador interactivo
             gen_cmd = (
@@ -256,6 +261,12 @@ def deploy_robot_to_server(
         }
 
 
+class TriggerResult(dict):
+    """Resultado de trigger de Airflow que permite acceso por dict y desempaquetado de tupla (success, output)."""
+    def __iter__(self):
+        return iter((self.get("success", False), self.get("output", "")))
+
+
 def trigger_dag_on_server(
     host: str,
     port: int = 22,
@@ -264,9 +275,10 @@ def trigger_dag_on_server(
     remote_base_path: str = "/home/datax-pds/datax/data-processing-platform-dev",
     dag_id: str = "",
     conf: Optional[Dict] = None,
+    report_code: Optional[str] = None,
     log_callback: Optional[Callable[[str], None]] = None
-) -> Dict:
-    """Dispara un DAG de Airflow en el servidor remoto con parámetros de configuración."""
+) -> TriggerResult:
+    """Dispara un DAG de Airflow en el servidor remoto con parametros de configuracion."""
     logs = []
 
     def log(msg: str):
@@ -275,12 +287,12 @@ def trigger_dag_on_server(
             log_callback(msg)
 
     import json
-    conf_json = json.dumps(conf or {})
+    import re
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
-        log(f"🔌 Conectando a {username}@{host}:{port}...")
+        log(f"Conectando a {username}@{host}:{port}...")
         client.connect(
             hostname=host,
             port=port,
@@ -289,14 +301,30 @@ def trigger_dag_on_server(
             timeout=10,
             look_for_keys=True if not password else False
         )
-        log("✅ Conexión SSH establecida.")
+        log("Conexion SSH establecida.")
 
-        # Comando para disparar DAG en Airflow worker
-        cmd = (
-            f"cd {remote_base_path} && "
-            f"docker compose exec -T airflow-worker airflow dags trigger {dag_id} --conf '{conf_json}'"
-        )
-        log(f"🚀 Ejecutando: docker compose exec -T airflow-worker airflow dags trigger {dag_id}...")
+        # Si viene report_code, buscar dinamicamente el ultimo SQLite y disparar
+        if report_code:
+            parts = report_code.split("_")
+            country = parts[1] if len(parts) > 1 and len(parts[1]) == 2 else "BO"
+            rep_clean = "_".join(parts[2:]) if len(parts) > 2 else report_code
+
+            cmd = f'''docker exec data-processing-platform-dev-airflow-worker-1 bash -c '
+LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1)
+if [ -z "$LAST_SQLITE" ]; then
+  LAST_SQLITE=$(find /mnt/datos1/data_process/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1)
+fi
+echo "Migrando archivo: $LAST_SQLITE"
+airflow dags trigger {dag_id} --conf "{{\"code\": \"{report_code}\", \"conversion_path\": \"$LAST_SQLITE\", \"id_conversion\": 1}}"
+' '''
+        else:
+            conf_json = json.dumps(conf or {})
+            cmd = (
+                f"cd {remote_base_path} && "
+                f"docker compose exec -T airflow-worker airflow dags trigger {dag_id} --conf '{conf_json}'"
+            )
+
+        log("Ejecutando comando en Airflow...")
         stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
 
         output_lines = []
@@ -310,13 +338,13 @@ def trigger_dag_on_server(
         client.close()
 
         success = (status == 0) or any("creating dag run" in l.lower() or "queued" in l.lower() for l in output_lines)
-        return {
+        return TriggerResult({
             "success": success,
             "logs": logs,
             "output": "\n".join(output_lines)
-        }
+        })
     except Exception as exc:
         if client:
             client.close()
-        log(f"❌ Error al disparar DAG: {exc}")
-        return {"success": False, "logs": logs, "output": str(exc)}
+        log(f"Error al disparar DAG: {exc}")
+        return TriggerResult({"success": False, "logs": logs, "output": str(exc)})
