@@ -9,13 +9,13 @@ try:
 except ImportError:
     pass
 
-DEFAULT_OLD_REPO = r"E:\DATAX\data-processing-platform-nico"
-DEFAULT_NEW_REPO = r"E:\DATAX\data-processing-platform-dev-nico"
-DEFAULT_DB_HOST = "10.0.0.16"
-DEFAULT_DB_PORT = 5434
-DEFAULT_DB_USER = "postgres"
-DEFAULT_DB_PASS = "datax"
-DEFAULT_DB_NAME = "platform_db"
+DEFAULT_OLD_REPO = os.getenv("OLD_REPO_PATH", r"C:\Users\DATAX\Documents\Nicolas\data-processing-platform")
+DEFAULT_NEW_REPO = os.getenv("NEW_REPO_PATH", r"C:\Users\DATAX\Documents\Nicolas\data-processing-platform-dev")
+DEFAULT_DB_HOST = os.getenv("DB_HOST", "10.0.0.16")
+DEFAULT_DB_PORT = int(os.getenv("DB_PORT", 5434))
+DEFAULT_DB_USER = os.getenv("DB_USER", "postgres")
+DEFAULT_DB_PASS = os.getenv("DB_PASS", "datax")
+DEFAULT_DB_NAME = os.getenv("DB_NAME", "platform_db")
 
 DEFAULT_GITHUB_REPO = os.getenv("GITHUB_REPO", "datax-platform/data-processing-modules")
 DEFAULT_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")

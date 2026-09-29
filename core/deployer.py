@@ -314,9 +314,10 @@ def trigger_dag_on_server(
             conf_str = f'--conf "{chr(123)}{bs}{q}code{bs}{q}: {bs}{q}{report_code}{bs}{q}, {bs}{q}conversion_path{bs}{q}: {bs}{q}$LAST_SQLITE{bs}{q}, {bs}{q}id_conversion{bs}{q}: 1{chr(125)}"'
 
             bash_script = (
-                f'LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
-                f'[ -z "$LAST_SQLITE" ] && LAST_SQLITE=$(find /mnt/datos1/data_process/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
-                f'echo "Migrando archivo: $LAST_SQLITE"; '
+                f'LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
+                f'[ -z "$LAST_SQLITE" ] && LAST_SQLITE=$(find /mnt/datos1/data_process/ -type f -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
+                f'[ -z "$LAST_SQLITE" ] && LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
+                f'echo "Migrando archivo detectado: $LAST_SQLITE"; '
                 f'airflow dags trigger {dag_id} {conf_str}'
             )
             cmd = f"docker exec data-processing-platform-dev-airflow-worker-1 bash -c '{bash_script}'"

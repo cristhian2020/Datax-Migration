@@ -91,7 +91,7 @@ def get_migration_db_info(report_code: str, engine) -> Optional[Dict]:
         return None
 
 
-def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
+def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text: str = "") -> Dict:
     """Inspecciona la tabla SQLite para obtener columnas, muestras y sugerir metricas y unidades."""
     with sqlite3.connect(sqlite_path) as conn:
         cursor = conn.cursor()
@@ -119,51 +119,114 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
     combined_titles_lower = combined_titles.lower()
 
     nv1_sample = " ".join(df["nv1"].dropna().head(10).astype(str)).lower() if "nv1" in df.columns else ""
-    full_header_text = (combined_titles_lower + " " + nv1_sample).strip()
+    full_header_text = (combined_titles_lower + " " + nv1_sample + " " + str(extra_text or "").lower()).strip()
+    full_norm = unicodedata.normalize('NFD', full_header_text).encode('ascii', 'ignore').decode('utf-8')
+    titles_norm = unicodedata.normalize('NFD', combined_titles_lower).encode('ascii', 'ignore').decode('utf-8')
 
     # Deteccion de factor sugerido
     suggested_factor = 1.0
-    if "millones" in full_header_text:
+    if "millones" in full_norm:
         suggested_factor = 1000000.0
-    elif "miles" in full_header_text:
+    elif "miles" in full_norm:
         suggested_factor = 1000.0
 
     # Deteccion de moneda base y tipos de cambio
-    has_usd_kw = any(k in full_header_text for k in ["dolares", "dólares", "usd", "$us", "moneda extranjera", "del exterior"])
-    has_bob_kw = any(k in full_header_text for k in ["bolivianos", "bob", "moneda nacional", " bs", "bs."])
+    has_usd_kw = any(k in full_norm for k in ["dolares", "usd", "$us", "moneda extranjera", "del exterior"])
+    has_bob_kw = any(k in full_norm for k in ["bolivianos", "bob", "moneda nacional", " bs", "bs."])
 
-    suggested_metric = "moneda"
-    suggested_unit = "USD" if (has_usd_kw and not has_bob_kw) else "BOB"
-
-    if "tipo de cambio" in full_header_text or "cotizacion" in full_header_text or "cotización" in full_header_text:
+    # 1. Energia y Potencia Electrica (GWh, MWh, kWh, Wh, GW, MW, kW)
+    if re.search(r'[\(\[\s]gwh[\)\]\s]|\bgwh\b', titles_norm) or re.search(r'[\(\[\s]gwh[\)\]\s]|\bgwh\b', full_norm):
+        suggested_metric = "energia"
+        suggested_unit = "GWh"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]mwh[\)\]\s]|\bmwh\b', titles_norm) or re.search(r'[\(\[\s]mwh[\)\]\s]|\bmwh\b', full_norm):
+        suggested_metric = "energia"
+        suggested_unit = "MWh"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]kwh[\)\]\s]|\bkwh\b', titles_norm) or re.search(r'[\(\[\s]kwh[\)\]\s]|\bkwh\b', full_norm):
+        suggested_metric = "energia"
+        suggested_unit = "kWh"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]wh[\)\]\s]|\bwh\b', titles_norm) or re.search(r'[\(\[\s]wh[\)\]\s]|\bwh\b', full_norm):
+        suggested_metric = "energia"
+        suggested_unit = "Wh"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]gw[\)\]\s]|\bgw\b', titles_norm) or re.search(r'[\(\[\s]gw[\)\]\s]|\bgw\b', full_norm):
+        suggested_metric = "potencia"
+        suggested_unit = "GW"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]mw[\)\]\s]|\bmw\b', titles_norm) or re.search(r'[\(\[\s]mw[\)\]\s]|\bmw\b', full_norm):
+        suggested_metric = "potencia"
+        suggested_unit = "MW"
+        suggested_factor = 1.0
+    elif re.search(r'[\(\[\s]kw[\)\]\s]|\bkw\b', titles_norm) or re.search(r'[\(\[\s]kw[\)\]\s]|\bkw\b', full_norm):
+        suggested_metric = "potencia"
+        suggested_unit = "kW"
+        suggested_factor = 1.0
+    elif any(k in full_norm for k in ["despacho de carga", "demanda de energia", "generacion electrica", "consumo electrico"]):
+        suggested_metric = "energia"
+        suggested_unit = "GWh" if "gwh" in full_norm else ("MWh" if "mwh" in full_norm else "MWh")
+        suggested_factor = 1.0
+    # 2. Tipos de cambio
+    elif "tipo de cambio" in full_norm or "cotizacion" in full_norm or "paridad" in full_norm:
         suggested_metric = "tipo_cambio"
         suggested_factor = 1.0
-        if "ufv" in full_header_text:
+        if "ufv" in full_norm:
             suggested_unit = "BOB/UFV"
         else:
             suggested_unit = "BOB/USD"
-    elif "tasa" in full_header_text or "tasas" in full_header_text:
+    # 3. Tasas
+    elif "tasa" in full_norm or "tasas" in full_norm or "rendimiento" in full_norm:
         suggested_metric = "tasa"
         suggested_unit = "%"
         suggested_factor = 1.0
-    elif "porcentaje" in full_header_text or "%" in full_header_text:
+    # 4. Porcentajes y ratios
+    elif "porcentaje" in full_norm or "%" in full_norm:
         suggested_metric = "porcentaje"
         suggested_unit = "%"
         suggested_factor = 1.0
-    elif "indice" in full_header_text or "índice" in full_header_text:
+    # 5. Indices
+    elif "indice" in full_norm:
         suggested_metric = "indice"
-        match_base = re.search(r"(\d{4}\s*=\s*100)", full_header_text)
+        match_base = re.search(r"(\d{4}\s*=\s*100)", full_norm)
         suggested_unit = match_base.group(1).replace(" ", "") if match_base else "puntos"
         suggested_factor = 1.0
-    elif "toneladas" in full_header_text or "tonelada" in full_header_text or "tm" in full_header_text:
+    # 6. Volumen / Hidrocarburos / Peso
+    elif any(k in full_norm for k in ["toneladas", "tonelada", "tm", "tn"]):
         suggested_metric = "volumen"
         suggested_unit = "Tn"
         suggested_factor = 1.0
-    elif "mwh" in full_header_text:
-        suggested_metric = "energia"
-        suggested_unit = "MWh"
+    elif re.search(r'\b(mmpcd|mpcd)\b', full_norm):
+        suggested_metric = "volumen"
+        suggested_unit = "MMpcd"
+        suggested_factor = 1.0
+    elif re.search(r'\b(bbl|barriles)\b', full_norm):
+        suggested_metric = "volumen"
+        suggested_unit = "Bbl"
+        suggested_factor = 1.0
+    elif re.search(r'\b(m3|metros cubicos)\b', full_norm):
+        suggested_metric = "volumen"
+        suggested_unit = "m3"
+        suggested_factor = 1.0
+    elif re.search(r'\b(litros|lts)\b', full_norm):
+        suggested_metric = "volumen"
+        suggested_unit = "L"
+        suggested_factor = 1.0
+    # 7. Clima
+    elif any(k in full_norm for k in ["temperatura", "celsius", "centigrados"]) or "°c" in full_header_text.lower():
+        suggested_metric = "temperatura"
+        suggested_unit = "°C"
+        suggested_factor = 1.0
+    elif any(k in full_norm for k in ["precipitacion", "pluviosidad", "lluvia"]) or "mm" in full_norm:
+        suggested_metric = "precipitacion"
+        suggested_unit = "mm"
+        suggested_factor = 1.0
+    # 8. Moneda por defecto
+    else:
+        suggested_metric = "moneda"
+        suggested_unit = "USD" if (has_usd_kw and not has_bob_kw) else "BOB"
 
-    # Deteccion de monedas multiples y filas hibridas
+    # Deteccion de monedas multiples, energia y filas hibridas
     detected_currencies = set()
     has_mixed_rows = False
 
@@ -183,6 +246,18 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
                     detected_currencies.add("BOB/USD")
                 if "BS/UFV" in vu or "BOB/UFV" in vu or ("TIPO DE CAMBIO" in vu and "UFV" in words):
                     detected_currencies.add("BOB/UFV")
+
+                # Deteccion de unidades de energia/potencia en filas
+                if "GWH" in words:
+                    detected_currencies.add("GWh")
+                if "MWH" in words:
+                    detected_currencies.add("MWh")
+                if "KWH" in words:
+                    detected_currencies.add("kWh")
+                if "MW" in words:
+                    detected_currencies.add("MW")
+                if "KW" in words:
+                    detected_currencies.add("kW")
 
                 vl = v.lower()
                 if "%" in vl or "participaci" in vl or "veces" in vl or "ratio" in vl:
@@ -300,6 +375,10 @@ class {report_code}(Migration_Base):
                 return "tasa"
             if any(tok in combined for tok in ["TIPO DE CAMBIO", "COTIZACION", "COTIZACIÓN", "BS/USD", "BOB/USD", "BS/UFV", "BOB/UFV"]):
                 return "tipo_cambio"
+            if any(tok in combined for tok in ["GWH", "MWH", "KWH", "ENERGIA", "ENERGÍA"]):
+                return "energia"
+            if any(tok in combined for tok in ["POTENCIA", " MW", "(MW)", " GW", "(GW)", " KW", "(KW)"]):
+                return "potencia"
             return "{metric}"
 
         def get_unit(row) -> str:
@@ -312,6 +391,20 @@ class {report_code}(Migration_Base):
             match_base = re.search(r"(\\d{{4}}\\s*=\\s*100)", combined)
             if match_base:
                 return match_base.group(1).replace(" ", "")
+            for t in texts:
+                words = set(re.split(r"[\\s/()]+", t))
+                if "GWH" in words:
+                    return "GWh"
+                if "MWH" in words:
+                    return "MWh"
+                if "KWH" in words:
+                    return "kWh"
+                if "MW" in words:
+                    return "MW"
+                if "GW" in words:
+                    return "GW"
+                if "KW" in words:
+                    return "kW"
             for t in texts:
                 if any(tok in t for tok in ["BS/USD", "BOB/USD", "BS / USD", "BOB / USD"]) or ("TIPO DE CAMBIO" in t and any(tok in t for tok in ["USD", "DOLAR", "DÓLAR"])):
                     return "BOB/USD"
@@ -417,3 +510,42 @@ def save_migration_files(
         f.write(py_content)
 
     return sql_path, py_path
+
+
+def get_latest_conversion_for_report(report_code: str, engine) -> Optional[Dict]:
+    """Obtiene la última conversión registrada para este reporte en platform_db con su archivo SQLite."""
+    query = text("""
+        SELECT c.id_conversion, c.conversion_path, c.converted_to, c.conversion_date, c.id_download
+        FROM conversion c
+        JOIN report r ON c.id_report = r.id_report
+        WHERE r.code = :code AND c.conversion_path IS NOT NULL
+        ORDER BY c.converted_to DESC, c.id_conversion DESC
+        LIMIT 1;
+    """)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(query, {"code": report_code}).fetchone()
+            if not row:
+                return None
+
+            conv_path = str(row[1] or "")
+            unix_path = conv_path.replace("\\", "/")
+            if unix_path.startswith("//10.0.0.16/data_process/"):
+                unix_path = unix_path.replace("//10.0.0.16/data_process/", "/mnt/datos1/data_process/")
+            elif unix_path.startswith("/10.0.0.16/data_process/"):
+                unix_path = unix_path.replace("/10.0.0.16/data_process/", "/mnt/datos1/data_process/")
+            elif unix_path.startswith("//10.0.0.12/data_process/"):
+                unix_path = unix_path.replace("//10.0.0.12/data_process/", "/media/datax/Local_Disk_B/data_process/")
+
+            return {
+                "id_conversion": int(row[0]),
+                "conversion_path_raw": conv_path,
+                "conversion_path": unix_path,
+                "converted_to": str(row[2]) if row[2] else "-",
+                "conversion_date": str(row[3]) if row[3] else "-",
+                "id_download": row[4]
+            }
+    except Exception as exc:
+        print(f"Error al consultar latest conversion: {exc}")
+        return None
+

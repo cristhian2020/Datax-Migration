@@ -1,0 +1,31 @@
+# Entornos y secretos
+.env
+.env.*
+!.env.example
+
+# Python y bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Crash dumps y archivos temporales del SO
+*.stackdump
+*.log
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# IDEs y Editores
+.vscode/
+.idea/
+*.swp
+*.swo

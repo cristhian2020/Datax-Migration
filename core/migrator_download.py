@@ -104,8 +104,23 @@ def refactor_download_code(raw_code: str, code: str, download_type: str = "") ->
     code_content = code_content.replace('row.query_selector_all("//td")', 'row.query_selector_all("td")')
     code_content = code_content.replace("row.query_selector_all('//td')", "row.query_selector_all('td')")
 
+    # Ajustes Tipo II: asegurar llaves y URL para robots específicos
+    if code == "D_BO_000000043":
+        code_content = code_content.replace(
+            "page.goto(main_url, wait_until='load')",
+            "target_url = main_url if 'statistics' in str(main_url).lower() else 'https://www.icco.org/statistics/'\n                page.goto(target_url, wait_until='load')"
+        )
+        code_content = code_content.replace(
+            'file_paths.append({\n                                "tmp_path": download_path})',
+            'file_paths.append({"tmp_path": download_path, "download_url": target_url})'
+        )
+        code_content = code_content.replace(
+            'file_paths.append({"tmp_path": download_path})',
+            'file_paths.append({"tmp_path": download_path, "download_url": target_url})'
+        )
+
     # Regla Tipo I compare_files False
-    if "Tipo I" in str(download_type):
+    if re.search(r"\bTipo\s+I\b|file_download_type_i|file_download_template", str(download_type), re.IGNORECASE):
         if "def compare_files" in code_content:
             parts = code_content.split("def compare_files")
             body = re.sub(r"return\s+\[\]\s*$", "return False", parts[1], flags=re.MULTILINE)
@@ -149,13 +164,17 @@ def apply_download_migration(code: str, source_file: str, new_repo_path: str, do
 
         # 2. Test Unitario
         if not skip_test:
-            type_map = {
-                "Tipo I": "test_download_type_i.py",
-                "Tipo II": "test_download_type_ii.py",
-                "Tipo III": "test_download_type_iii.py",
-                "Tipo IV": "test_download_type_iv.py",
-            }
-            test_file = next((v for k, v in type_map.items() if k in str(download_type)), None)
+            type_map = [
+                (r"\bTipo\s+IV\b|file_download_type_iv|multi_file_download_template", "test_download_type_iv.py"),
+                (r"\bTipo\s+III\b|file_download_type_iii|data_download_template", "test_download_type_iii.py"),
+                (r"\bTipo\s+II\b|file_download_type_ii|direct_download_template", "test_download_type_ii.py"),
+                (r"\bTipo\s+I\b|file_download_type_i|file_download_template", "test_download_type_i.py"),
+            ]
+            test_file = None
+            for pattern, t_file in type_map:
+                if re.search(pattern, str(download_type), re.IGNORECASE):
+                    test_file = t_file
+                    break
             if test_file:
                 test_path = os.path.join(new_repo_path, "models", "download", "tests", test_file)
                 logs.append(f"🧪 Ejecutando test unitario: {test_file}...")

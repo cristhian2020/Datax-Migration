@@ -55,10 +55,9 @@ from core.migrator_migration import (
     generate_migration_sql,
     generate_migration_py,
     save_migration_files,
+    get_latest_conversion_for_report,
 )
-from core.deployer import trigger_dag_on_server
 from core.deployer import (
-    trigger_dag_on_server,
     test_connection,
     list_migrated_robots,
     deploy_robot_to_server,
@@ -811,7 +810,8 @@ elif "Robots de Migración" in mode:
         else:
             st.caption(f"ℹ️ Archivo SQLite detectado: `{sqlite_file}`")
 
-        struct = inspect_sqlite_structure(sqlite_file, sel_report)
+        report_db_name = db_mig_info.get("name", "") if db_mig_info else ""
+        struct = inspect_sqlite_structure(sqlite_file, sel_report, extra_text=report_db_name)
         
         tab_cfg, tab_preview, tab_deploy = st.tabs([
             "⚙️ 1. Configuración & Estructura",
@@ -822,14 +822,26 @@ elif "Robots de Migración" in mode:
         with tab_cfg:
             col_c1, col_c2 = st.columns(2)
             with col_c1:
-                metric_options = ["moneda", "porcentaje", "indice", "volumen", "tasa", "tipo_cambio", "energia", "ratio", "temperatura", "precipitacion"]
+                metric_options = [
+                    "moneda", "energia", "potencia", "porcentaje", "indice", "volumen", 
+                    "tasa", "tipo_cambio", "ratio", "temperatura", "precipitacion", "conteo"
+                ]
                 def_metric_idx = metric_options.index(struct["suggested_metric"]) if struct["suggested_metric"] in metric_options else 0
                 chosen_metric = st.selectbox("Métrica Base:", metric_options, index=def_metric_idx)
-                common_units = ["BOB", "USD", "UFV", "BOB/USD", "BOB/UFV", "%", "veces", "puntos", "Tn", "MWh"]
+                
+                common_units = [
+                    "BOB", "USD", "UFV", "BOB/USD", "BOB/UFV", "%", "veces", "puntos",
+                    "GWh", "MWh", "kWh", "Wh", "GW", "MW", "kW",
+                    "Tn", "Kg", "m3", "MMpcd", "Bbl", "litros", "unidades", "personas", "°C", "mm"
+                ]
                 sug_u = struct["suggested_unit"]
                 if sug_u not in common_units:
                     common_units.insert(0, sug_u)
                 chosen_unit = st.selectbox("Unidad Métrica Base:", common_units, index=common_units.index(sug_u) if sug_u in common_units else 0, help="Unidad predominante del reporte.")
+                custom_unit = st.text_input("✍️ O escribir otra unidad personalizada (opcional):", value="", placeholder="Ej: GWh, MWh, Bbl, etc.")
+                if custom_unit.strip():
+                    chosen_unit = custom_unit.strip()
+
             with col_c2:
                 default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else struct["suggested_factor"]
                 chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0)
@@ -866,6 +878,10 @@ elif "Robots de Migración" in mode:
                         return "tasa"
                     if any(tok in combined for tok in ["TIPO DE CAMBIO", "COTIZACION", "COTIZACIÓN", "BS/USD", "BOB/USD", "BS/UFV", "BOB/UFV"]):
                         return "tipo_cambio"
+                    if any(tok in combined for tok in ["GWH", "MWH", "KWH", "ENERGIA", "ENERGÍA"]):
+                        return "energia"
+                    if any(tok in combined for tok in ["POTENCIA", " MW", "(MW)", " GW", "(GW)", " KW", "(KW)"]):
+                        return "potencia"
                     return chosen_metric
 
                 def preview_get_unit(row):
@@ -878,6 +894,20 @@ elif "Robots de Migración" in mode:
                     match_base = re.search(r"(\d{4}\s*=\s*100)", combined)
                     if match_base:
                         return match_base.group(1).replace(" ", "")
+                    for t in texts:
+                        words = set(re.split(r"[\s/()]+", t))
+                        if "GWH" in words:
+                            return "GWh"
+                        if "MWH" in words:
+                            return "MWh"
+                        if "KWH" in words:
+                            return "kWh"
+                        if "MW" in words:
+                            return "MW"
+                        if "GW" in words:
+                            return "GW"
+                        if "KW" in words:
+                            return "kW"
                     for t in texts:
                         if any(tok in t for tok in ["BS/USD", "BOB/USD", "BS / USD", "BOB / USD"]) or ("TIPO DE CAMBIO" in t and any(tok in t for tok in ["USD", "DOLAR", "DÓLAR"])):
                             return "BOB/USD"
@@ -970,25 +1000,55 @@ elif "Robots de Migración" in mode:
 
                 st.markdown("---")
                 st.markdown("#### ⚡ Disparar DAG en Airflow")
+                st.caption("Ejecuta el DAG de migración en Airflow con la última conversión registrada.")
+
+                latest_conv = get_latest_conversion_for_report(sel_report, engine) if (db_connected and engine is not None) else None
+                if latest_conv:
+                    st.info(
+                        f"🎯 **Última Conversión detectada en BD:** ID `{latest_conv['id_conversion']}` | "
+                        f"Corte: **`{latest_conv['converted_to']}`** (Registrada: `{latest_conv['conversion_date']}`)\n\n"
+                        f"📁 Archivo: `{latest_conv['conversion_path']}`"
+                    )
+                    default_conv_id = latest_conv["id_conversion"]
+                    default_conv_path = latest_conv["conversion_path"]
+                else:
+                    default_conv_id = 1
+                    parts = mig_parent_code.split("_")
+                    c_tag = parts[1] if len(parts) > 1 else "BO"
+                    default_conv_path = f"/mnt/datos1/data_process/{c_tag}/{mig_parent_code.replace('M_', 'D_')}/{sel_report}.sqlite"
+
+                col_mt1, col_mt2 = st.columns(2)
+                with col_mt1:
+                    trig_mig_code = st.text_input("Código reporte (--conf 'code'):", value=sel_report, key=f"trig_mig_code_{sel_report}")
+                    trig_mig_id = st.number_input("ID conversión (--conf 'id_conversion'):", value=default_conv_id, step=1, key=f"trig_mig_id_{sel_report}")
+                with col_mt2:
+                    trig_mig_path = st.text_input("Ruta SQLite (--conf 'conversion_path'):", value=default_conv_path, key=f"trig_mig_path_{sel_report}")
+
                 if st.button(f"▶️ Disparar DAG {mig_parent_code} en Airflow", use_container_width=True):
                     if not mig_ssh_pass:
-                        st.error("Ingresa la contraseña de SSH.")
+                        st.error("Ingresa la contraseña de SSH arriba para conectar al servidor.")
                     else:
-                        with st.spinner("Disparando DAG en Airflow worker..."):
-                            trig_ok, trig_log = trigger_dag_on_server(
+                        conf_payload = {
+                            "code": trig_mig_code,
+                            "id_conversion": int(trig_mig_id),
+                            "conversion_path": trig_mig_path
+                        }
+                        corte_str = f" con corte {latest_conv['converted_to']}" if latest_conv else ""
+                        with st.spinner(f"Disparando DAG {mig_parent_code} en Airflow worker{corte_str}..."):
+                            trig_res = trigger_dag_on_server(
                                 host="10.0.0.16",
                                 port=22,
                                 username="datax-pds",
                                 password=mig_ssh_pass,
                                 dag_id=mig_parent_code,
-                                report_code=sel_report
+                                conf=conf_payload
                             )
-                        if trig_ok:
-                            st.success(f"DAG `{mig_parent_code}` disparado exitosamente.")
+                        if trig_res["success"]:
+                            st.success(f"🎉 DAG `{mig_parent_code}` disparado exitosamente{corte_str}!")
                         else:
-                            st.error(f"Fallo al disparar DAG.")
+                            st.warning("El comando terminó con advertencias o error.")
                         with st.expander("Ver logs de disparo de Airflow", expanded=True):
-                            st.code(trig_log or "Sin salida de terminal.")
+                            st.code(trig_res["output"] or "Sin salida de terminal.")
 
 elif mode == "📊 Migración por Lote":
     st.header("📊 Migración Masiva por Lote (Batch)")
