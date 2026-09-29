@@ -1,3 +1,4 @@
+import unicodedata
 """Lógica de generación y preparación de robots y DAGs de migración (PostgreSQL / Airflow V2)."""
 
 import os
@@ -7,6 +8,15 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from sqlalchemy import text
 
+
+
+def standardize_col_name(col: str) -> str:
+    """Normaliza nombres de columnas a snake_case valido para PostgreSQL (sin espacios ni acentos)."""
+    cleaned = re.sub(r'[\t\xa0]+', '', str(col)).strip()
+    s = re.sub(r'\s+', '_', cleaned.lower())
+    s = unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode('utf-8')
+    s = re.sub(r'[^a-z0-9_]', '', s)
+    return s
 
 def scan_conversion_outputs(repo_path: str) -> List[Dict]:
     """Escanea models/conversion/ en busca de familias y archivos .sqlite generados listos para migrar."""
@@ -82,7 +92,7 @@ def get_migration_db_info(report_code: str, engine) -> Optional[Dict]:
 
 
 def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
-    """Inspecciona la tabla SQLite para obtener columnas, muestras y sugerir métricas y unidades."""
+    """Inspecciona la tabla SQLite para obtener columnas, muestras y sugerir metricas y unidades."""
     with sqlite3.connect(sqlite_path) as conn:
         cursor = conn.cursor()
         if not table_name:
@@ -91,9 +101,10 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
             table_name = tables[0] if tables else ""
         cursor.execute(f'PRAGMA table_info("{table_name}");')
         pragma_cols = [row[1] for row in cursor.fetchall()]
-        df = pd.read_sql_query(f'SELECT * FROM "{table_name}" LIMIT 100;', conn)
+        df = pd.read_sql_query(f'SELECT * FROM "{table_name}" LIMIT 200;', conn)
 
-    cols_clean = [re.sub(r'[\t\xa0]+', '', str(c)).strip() for c in pragma_cols if str(c).strip() != 'file']
+    df.columns = [standardize_col_name(c) if str(c).lower().strip() != 'file' else 'file' for c in df.columns]
+    cols_clean = [standardize_col_name(c) for c in pragma_cols if str(c).lower().strip() != 'file']
 
     title_cols = [c for c in cols_clean if c.startswith('titulo')]
     nv_cols = [c for c in cols_clean if c.startswith('nv')]
@@ -107,48 +118,79 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
                 combined_titles += " " + " ".join(vals)
     combined_titles_lower = combined_titles.lower()
 
-    # Detección inicial de factor sugerido
+    nv1_sample = " ".join(df["nv1"].dropna().head(10).astype(str)).lower() if "nv1" in df.columns else ""
+    full_header_text = (combined_titles_lower + " " + nv1_sample).strip()
+
+    # Deteccion de factor sugerido
     suggested_factor = 1.0
-    if "millones" in combined_titles_lower:
+    if "millones" in full_header_text:
         suggested_factor = 1000000.0
-    elif "miles" in combined_titles_lower:
+    elif "miles" in full_header_text:
         suggested_factor = 1000.0
 
-    # Detección de métrica y unidad sugerida
+    # Deteccion de moneda base y tipos de cambio
+    has_usd_kw = any(k in full_header_text for k in ["dolares", "dólares", "usd", "$us", "moneda extranjera", "del exterior"])
+    has_bob_kw = any(k in full_header_text for k in ["bolivianos", "bob", "moneda nacional", " bs", "bs."])
+
     suggested_metric = "moneda"
-    suggested_unit = "BOB"
-    if "tasa" in combined_titles_lower or "tasas" in combined_titles_lower:
+    suggested_unit = "USD" if (has_usd_kw and not has_bob_kw) else "BOB"
+
+    if "tipo de cambio" in full_header_text or "cotizacion" in full_header_text or "cotización" in full_header_text:
+        suggested_metric = "tipo_cambio"
+        suggested_factor = 1.0
+        if "ufv" in full_header_text:
+            suggested_unit = "BOB/UFV"
+        else:
+            suggested_unit = "BOB/USD"
+    elif "tasa" in full_header_text or "tasas" in full_header_text:
         suggested_metric = "tasa"
         suggested_unit = "%"
         suggested_factor = 1.0
-    elif "porcentaje" in combined_titles_lower or "%" in combined_titles_lower:
+    elif "porcentaje" in full_header_text or "%" in full_header_text:
         suggested_metric = "porcentaje"
         suggested_unit = "%"
         suggested_factor = 1.0
-    elif "indice" in combined_titles_lower or "índice" in combined_titles_lower:
+    elif "indice" in full_header_text or "índice" in full_header_text:
         suggested_metric = "indice"
-        match_base = re.search(r"(\d{4}\s*=\s*100)", combined_titles)
+        match_base = re.search(r"(\d{4}\s*=\s*100)", full_header_text)
         suggested_unit = match_base.group(1).replace(" ", "") if match_base else "puntos"
         suggested_factor = 1.0
-    elif "toneladas" in combined_titles_lower or "tonelada" in combined_titles_lower or "tm" in combined_titles_lower:
+    elif "toneladas" in full_header_text or "tonelada" in full_header_text or "tm" in full_header_text:
         suggested_metric = "volumen"
         suggested_unit = "Tn"
         suggested_factor = 1.0
-    elif "tasa" in combined_titles_lower:
-        suggested_metric = "tasa"
-        suggested_unit = "%"
-        suggested_factor = 1.0
-    elif "mwh" in combined_titles_lower:
+    elif "mwh" in full_header_text:
         suggested_metric = "energia"
         suggested_unit = "MWh"
 
+    # Deteccion de monedas multiples y filas hibridas
+    detected_currencies = set()
     has_mixed_rows = False
+
     for col in nv_cols:
         if col in df.columns:
-            str_vals = df[col].dropna().astype(str).str.lower().tolist()
-            if any("%" in v or "participaci" in v or "veces" in v or "ratio" in v for v in str_vals):
-                has_mixed_rows = True
-                break
+            str_vals = df[col].dropna().astype(str).tolist()
+            for v in str_vals:
+                vu = v.upper()
+                words = set(re.split(r'[\s/()]+', vu))
+                if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in vu:
+                    detected_currencies.add("BOB")
+                if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in vu:
+                    detected_currencies.add("USD")
+                if "UFV" in words:
+                    detected_currencies.add("UFV")
+                if "BS/USD" in vu or "BOB/USD" in vu or ("TIPO DE CAMBIO" in vu and any(w in ["USD", "DOLAR", "DÓLAR"] for w in words)):
+                    detected_currencies.add("BOB/USD")
+                if "BS/UFV" in vu or "BOB/UFV" in vu or ("TIPO DE CAMBIO" in vu and "UFV" in words):
+                    detected_currencies.add("BOB/UFV")
+
+                vl = v.lower()
+                if "%" in vl or "participaci" in vl or "veces" in vl or "ratio" in vl:
+                    has_mixed_rows = True
+
+    has_multi_currency = len(detected_currencies) > 1
+    if has_multi_currency:
+        has_mixed_rows = True
 
     return {
         "all_columns": cols_clean,
@@ -159,6 +201,8 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "") -> Dict:
         "suggested_unit": suggested_unit,
         "suggested_factor": suggested_factor,
         "has_mixed_rows": has_mixed_rows,
+        "has_multi_currency": has_multi_currency,
+        "detected_currencies": sorted(list(detected_currencies)),
         "titles_text": combined_titles.strip(),
         "sample_df": df.head(10)
     }
@@ -169,8 +213,9 @@ def generate_migration_sql(columns: List[str]) -> str:
     field_lines = ["  id UUID PRIMARY KEY DEFAULT gen_random_uuid()"]
 
     for col in columns:
-        if col not in ["fecha", "valor"]:
-            field_lines.append(f"  {col} text")
+        col_std = standardize_col_name(col)
+        if col_std not in ["fecha", "valor", "file", "id"]:
+            field_lines.append(f"  {col_std} text")
 
     field_lines.extend([
         "  fecha date",
@@ -213,97 +258,142 @@ def generate_migration_py(
     factor: float,
     has_mixed_rows: bool = False
 ) -> str:
-    """Genera el código Python del robot de migración heredando de Migration_Base."""
     clean_cols = [c for c in columns if c not in ["fecha", "valor"]]
     factor_num = int(factor) if factor == int(factor) else factor
+    rep_title = report_name or "Estandarizacion y carga a PostgreSQL"
 
     if has_mixed_rows:
-        return (
-            f'"""Migration robot for report {report_code}: {report_name or "Estandarización y carga a PostgreSQL"}."""\n\n'
-            'import re\n'
-            'from typing import Tuple\n'
-            'import pandas as pd\n'
-            'from models.migration.Migration_Base import Migration_Base\n\n\n'
-            f'class {report_code}(Migration_Base):\n'
-            f'    """Migration robot for {report_code}."""\n\n'
-            '    def standard_report(self, dataframe: pd.DataFrame, conversion_factor: int) -> Tuple[dict, pd.DataFrame]:\n'
-            '        """\n'
-            '        Enrich dataframe with metric and metric unit metadata.\n'
-            '        Manejo híbrido:\n'
-            '        - Filas de porcentaje/participación: metrica = \'porcentaje\', unidad_metrica = \'%\'\n'
-            '        - Filas de ratio/veces: metrica = \'ratio\', unidad_metrica = \'veces\'\n'
-            f'        - Filas monetarias: metrica = \'{metric}\', unidad_metrica = \'{unit}\' (escalado selectivo)\n'
-            '        """\n'
-            '        dataframe.columns = [re.sub(r"[\\t\\xa0]+", "", str(c)).strip() for c in dataframe.columns]\n\n'
-            '        for col in dataframe.columns:\n'
-            '            if col not in ["valor", "fecha"]:\n'
-            '                dataframe[col] = dataframe[col].apply(\n'
-            '                    lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None\n'
-            '                )\n\n'
-            '        def get_metric(row) -> str:\n'
-            f'            vals = " ".join([str(row.get(c, "")).lower() for c in {clean_cols}])\n'
-            '            if "%" in vals or "participaci" in vals:\n'
-            '                return "porcentaje"\n'
-            '            if "veces" in vals or "ratio" in vals:\n'
-            '                return "ratio"\n'
-            f'            return "{metric}"\n\n'
-            '        def get_unit(row) -> str:\n'
-            f'            vals = " ".join([str(row.get(c, "")).lower() for c in {clean_cols}])\n'
-            '            if "%" in vals or "participaci" in vals:\n'
-            '                return "%"\n'
-            '            if "veces" in vals or "ratio" in vals:\n'
-            '                return "veces"\n'
-            f'            return "{unit}"\n\n'
-            '        idx_valor = dataframe.columns.get_loc("valor")\n'
-            '        dataframe.insert(idx_valor, column="metrica", value=dataframe.apply(get_metric, axis=1))\n'
-            '        dataframe.insert(idx_valor + 1, column="unidad_metrica", value=dataframe.apply(get_unit, axis=1))\n\n'
-            '        dataframe["valor"] = pd.to_numeric(dataframe["valor"], errors="coerce")\n\n'
-            '        try:\n'
-            f'            factor_val = float(conversion_factor) if conversion_factor is not None else {float(factor)}\n'
-            '        except (ValueError, TypeError):\n'
-            f'            factor_val = {float(factor)}\n\n'
-            f'        if factor_val <= 1.0 and {float(factor)} > 1.0:\n'
-            f'            factor_val = {float(factor)}\n\n'
-            f'        if factor_val > 1.0:\n'
-            f'            mask_moneda = dataframe["metrica"] == "{metric}"\n'
-            '            dataframe.loc[mask_moneda, "valor"] = dataframe.loc[mask_moneda, "valor"] * factor_val\n\n'
-            '        return ({"conversion_factor": 1}, dataframe)\n\n\n'
-            f'Robot = {report_code}\n'
-        )
+        return f'''"""Migration robot for report {report_code}: {rep_title}."""
+
+import re
+from typing import Tuple
+import pandas as pd
+from models.migration.Migration_Base import Migration_Base
+
+
+class {report_code}(Migration_Base):
+    """Migration robot for {report_code}."""
+
+    def standard_report(self, dataframe: pd.DataFrame, conversion_factor: int) -> Tuple[dict, pd.DataFrame]:
+        """
+        Enrich dataframe with metric and metric unit metadata.
+        Mapeo dinamico de metricas y unidades (BOB, USD, UFV, tipos de cambio, ratios y porcentajes).
+        """
+        dataframe.columns = [re.sub(r"[\\t\\xa0]+", "", str(c)).strip() for c in dataframe.columns]
+
+        for col in dataframe.columns:
+            if col not in ["valor", "fecha"]:
+                dataframe[col] = dataframe[col].apply(
+                    lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None
+                )
+
+        def get_metric(row) -> str:
+            texts = [str(row.get(c, "")).upper() for c in reversed({clean_cols})]
+            combined = " ".join(texts)
+            if "%" in combined or "PARTICIPACI" in combined:
+                return "porcentaje"
+            if "VECES" in combined or "RATIO" in combined:
+                return "ratio"
+            if any(tok in combined for tok in ["INDICE", "ÍNDICE", "BASE 20", "BASE 19"]):
+                return "indice"
+            if any(tok in combined for tok in ["TASA", "RENDIMIENTO"]):
+                return "tasa"
+            if any(tok in combined for tok in ["TIPO DE CAMBIO", "COTIZACION", "COTIZACIÓN", "BS/USD", "BOB/USD", "BS/UFV", "BOB/UFV"]):
+                return "tipo_cambio"
+            return "{metric}"
+
+        def get_unit(row) -> str:
+            texts = [str(row.get(c, "")).upper() for c in reversed({clean_cols})]
+            combined = " ".join(texts)
+            if "%" in combined or "PARTICIPACI" in combined:
+                return "%"
+            if "VECES" in combined or "RATIO" in combined:
+                return "veces"
+            match_base = re.search(r"(\\d{{4}}\\s*=\\s*100)", combined)
+            if match_base:
+                return match_base.group(1).replace(" ", "")
+            for t in texts:
+                if any(tok in t for tok in ["BS/USD", "BOB/USD", "BS / USD", "BOB / USD"]) or ("TIPO DE CAMBIO" in t and any(tok in t for tok in ["USD", "DOLAR", "DÓLAR"])):
+                    return "BOB/USD"
+                if any(tok in t for tok in ["BS/UFV", "BOB/UFV", "BS / UFV", "BOB / UFV"]) or ("UFV" in t and "TIPO DE CAMBIO" in t) or ("BS/UFV" in t):
+                    return "BOB/UFV"
+            for t in texts:
+                words = set(re.split(r"[\\s/()]+", t))
+                if "UFV" in words:
+                    return "UFV"
+                if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in t or "DEL EXTERIOR" in t:
+                    return "USD"
+                if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in t:
+                    return "BOB"
+            return "{unit}"
+
+        idx_valor = dataframe.columns.get_loc("valor")
+        dataframe.insert(idx_valor, column="metrica", value=dataframe.apply(get_metric, axis=1))
+        dataframe.insert(idx_valor + 1, column="unidad_metrica", value=dataframe.apply(get_unit, axis=1))
+
+        dataframe["valor"] = pd.to_numeric(dataframe["valor"], errors="coerce")
+
+        try:
+            factor_val = float(conversion_factor) if conversion_factor is not None else {float(factor)}
+        except (ValueError, TypeError):
+            factor_val = {float(factor)}
+
+        if factor_val <= 1.0 and {float(factor)} > 1.0:
+            factor_val = {float(factor)}
+
+        if factor_val > 1.0:
+            mask_moneda = dataframe["metrica"] == "moneda"
+            dataframe.loc[mask_moneda, "valor"] = dataframe.loc[mask_moneda, "valor"] * factor_val
+
+        return ({{"conversion_factor": 1}}, dataframe)
+
+
+Robot = {report_code}
+'''
     else:
-        return (
-            f'"""Migration robot for report {report_code}: {report_name or "Estandarización y carga a PostgreSQL"}."""\n\n'
-            'import re\n'
-            'from typing import Tuple\n'
-            'import pandas as pd\n'
-            'from models.migration.Migration_Base import Migration_Base\n\n\n'
-            f'class {report_code}(Migration_Base):\n'
-            f'    """Migration robot for {report_code}."""\n\n'
-            '    def standard_report(self, dataframe: pd.DataFrame, conversion_factor: int) -> Tuple[dict, pd.DataFrame]:\n'
-            '        """\n'
-            '        Enrich dataframe with clean columns and metric metadata.\n'
-            f'        - metrica: \'{metric}\'\n'
-            f'        - unidad_metrica: \'{unit}\'\n'
-            f'        - conversion_factor: {factor_num}\n'
-            '        """\n'
-            '        dataframe.columns = [re.sub(r"[\\t\\xa0]+", "", str(c)).strip() for c in dataframe.columns]\n\n'
-            '        for col in dataframe.columns:\n'
-            '            if col not in ["valor", "fecha"]:\n'
-            '                dataframe[col] = dataframe[col].apply(\n'
-            '                    lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None\n'
-            '                )\n\n'
-            '        idx_valor = dataframe.columns.get_loc("valor")\n'
-            f'        dataframe.insert(idx_valor, column="metrica", value="{metric}")\n'
-            f'        dataframe.insert(idx_valor + 1, column="unidad_metrica", value="{unit}")\n\n'
-            '        try:\n'
-            f'            factor_val = int(conversion_factor) if conversion_factor is not None else {factor_num}\n'
-            '        except (ValueError, TypeError):\n'
-            f'            factor_val = {factor_num}\n\n'
-            f'        if factor_val <= 1 and {factor_num} > 1:\n'
-            f'            factor_val = {factor_num}\n\n'
-            '        return ({"conversion_factor": factor_val}, dataframe)\n\n\n'
-            f'Robot = {report_code}\n'
-        )
+        return f'''"""Migration robot for report {report_code}: {rep_title}."""
+
+import re
+from typing import Tuple
+import pandas as pd
+from models.migration.Migration_Base import Migration_Base
+
+
+class {report_code}(Migration_Base):
+    """Migration robot for {report_code}."""
+
+    def standard_report(self, dataframe: pd.DataFrame, conversion_factor: int) -> Tuple[dict, pd.DataFrame]:
+        """
+        Enrich dataframe with clean columns and metric metadata.
+        - metrica: '{metric}'
+        - unidad_metrica: '{unit}'
+        - conversion_factor: {factor_num}
+        """
+        dataframe.columns = [re.sub(r"[\\t\\xa0]+", "", str(c)).strip() for c in dataframe.columns]
+
+        for col in dataframe.columns:
+            if col not in ["valor", "fecha"]:
+                dataframe[col] = dataframe[col].apply(
+                    lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None
+                )
+
+        idx_valor = dataframe.columns.get_loc("valor")
+        dataframe.insert(idx_valor, column="metrica", value="{metric}")
+        dataframe.insert(idx_valor + 1, column="unidad_metrica", value="{unit}")
+
+        try:
+            factor_val = int(conversion_factor) if conversion_factor is not None else {factor_num}
+        except (ValueError, TypeError):
+            factor_val = {factor_num}
+
+        if factor_val <= 1 and {factor_num} > 1:
+            factor_val = {factor_num}
+
+        return ({{"conversion_factor": factor_val}}, dataframe)
+
+
+Robot = {report_code}
+'''
 
 
 def save_migration_files(

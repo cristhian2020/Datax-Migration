@@ -2,6 +2,7 @@
 
 import os
 import sys
+import re
 import streamlit as st
 import pandas as pd
 
@@ -821,22 +822,24 @@ elif "Robots de Migración" in mode:
         with tab_cfg:
             col_c1, col_c2 = st.columns(2)
             with col_c1:
-                metric_options = ["moneda", "porcentaje", "indice", "volumen", "tasa", "energia", "ratio", "temperatura", "precipitacion"]
+                metric_options = ["moneda", "porcentaje", "indice", "volumen", "tasa", "tipo_cambio", "energia", "ratio", "temperatura", "precipitacion"]
                 def_metric_idx = metric_options.index(struct["suggested_metric"]) if struct["suggested_metric"] in metric_options else 0
-                chosen_metric = st.selectbox("Métrica:", metric_options, index=def_metric_idx)
-                
-                chosen_unit = st.text_input("Unidad Métrica:", value=struct["suggested_unit"])
-
+                chosen_metric = st.selectbox("Métrica Base:", metric_options, index=def_metric_idx)
+                common_units = ["BOB", "USD", "UFV", "BOB/USD", "BOB/UFV", "%", "veces", "puntos", "Tn", "MWh"]
+                sug_u = struct["suggested_unit"]
+                if sug_u not in common_units:
+                    common_units.insert(0, sug_u)
+                chosen_unit = st.selectbox("Unidad Métrica Base:", common_units, index=common_units.index(sug_u) if sug_u in common_units else 0, help="Unidad predominante del reporte.")
             with col_c2:
                 default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else struct["suggested_factor"]
                 chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0)
-                
                 is_mixed = st.checkbox(
-                    "Reporte con filas híbridas (escalamiento selectivo)",
-                    value=struct["has_mixed_rows"],
-                    help="Si el reporte mezcla montos con porcentajes (%) o ratios, multiplica por el factor únicamente los montos monetarios para proteger las tasas."
+                    "💱 Mapeo dinámico de Monedas (BOB, USD, UFV, BOB/USD) y Ratios (%)",
+                    value=struct["has_mixed_rows"] or struct.get("has_multi_currency", False),
+                    help="Detecta fila por fila si el valor corresponde a BOB, USD, UFV, Tipo de Cambio o Porcentaje y aplica el escalado selectivo sobre filas monetarias."
                 )
-
+            if struct.get("has_multi_currency"):
+                st.info(f"💱 **Múltiples monedas detectadas en las filas:** `{'`, `'.join(struct['detected_currencies'])}` (El robot asignará dinámicamente cada moneda a su respectiva fila).")
             st.markdown("#### 📋 Columnas Detectadas en SQLite y Estructura de Migración")
             st.success(f"**Columnas completas para PostgreSQL ({len(struct['all_columns'])}):** `{struct['all_columns']}`")
             col_s1, col_s2 = st.columns(2)
@@ -847,8 +850,58 @@ elif "Robots de Migración" in mode:
                 st.markdown(f"• **Tiempo y Valor:** `['fecha', 'valor']`")
                 st.markdown(f"• **Columnas de Migración:** `['metrica', 'unidad_metrica']` *(se insertarán antes de `valor`)*")
             st.caption("ℹ️ *Nota: La columna `file` de SQLite se omite intencionalmente porque solo se usa como referencia local en la conversión y no pertenece a la tabla final de PostgreSQL.*")
-            st.markdown("**Vista Previa de Datos:** *(Desplaza la tabla hacia la derecha para ver todas las columnas)*")
-            st.dataframe(struct["sample_df"], use_container_width=True)
+            st.markdown("**Vista Previa de Datos Simulada:** *(Muestra cómo el robot clasificará cada fila con `metrica_preview` y `unidad_preview`)*")
+            preview_df = struct["sample_df"].copy()
+            if is_mixed:
+                def preview_get_metric(row):
+                    texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
+                    combined = " ".join(texts)
+                    if "%" in combined or "PARTICIPACI" in combined:
+                        return "porcentaje"
+                    if "VECES" in combined or "RATIO" in combined:
+                        return "ratio"
+                    if any(tok in combined for tok in ["INDICE", "ÍNDICE", "BASE 20", "BASE 19"]):
+                        return "indice"
+                    if any(tok in combined for tok in ["TASA", "RENDIMIENTO"]):
+                        return "tasa"
+                    if any(tok in combined for tok in ["TIPO DE CAMBIO", "COTIZACION", "COTIZACIÓN", "BS/USD", "BOB/USD", "BS/UFV", "BOB/UFV"]):
+                        return "tipo_cambio"
+                    return chosen_metric
+
+                def preview_get_unit(row):
+                    texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
+                    combined = " ".join(texts)
+                    if "%" in combined or "PARTICIPACI" in combined:
+                        return "%"
+                    if "VECES" in combined or "RATIO" in combined:
+                        return "veces"
+                    match_base = re.search(r"(\d{4}\s*=\s*100)", combined)
+                    if match_base:
+                        return match_base.group(1).replace(" ", "")
+                    for t in texts:
+                        if any(tok in t for tok in ["BS/USD", "BOB/USD", "BS / USD", "BOB / USD"]) or ("TIPO DE CAMBIO" in t and any(tok in t for tok in ["USD", "DOLAR", "DÓLAR"])):
+                            return "BOB/USD"
+                        if any(tok in t for tok in ["BS/UFV", "BOB/UFV", "BS / UFV", "BOB / UFV"]) or ("UFV" in t and "TIPO DE CAMBIO" in t) or ("BS/UFV" in t):
+                            return "BOB/UFV"
+                    for t in texts:
+                        words = set(re.split(r"[\s/()]+", t))
+                        if "UFV" in words:
+                            return "UFV"
+                        if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in t or "DEL EXTERIOR" in t:
+                            return "USD"
+                        if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in t:
+                            return "BOB"
+                    return chosen_unit
+
+                idx_val = preview_df.columns.get_loc("valor") if "valor" in preview_df.columns else len(preview_df.columns)
+                preview_df.insert(idx_val, "metrica_preview", preview_df.apply(preview_get_metric, axis=1))
+                preview_df.insert(idx_val + 1, "unidad_preview", preview_df.apply(preview_get_unit, axis=1))
+            else:
+                idx_val = preview_df.columns.get_loc("valor") if "valor" in preview_df.columns else len(preview_df.columns)
+                preview_df.insert(idx_val, "metrica_preview", chosen_metric)
+                preview_df.insert(idx_val + 1, "unidad_preview", chosen_unit)
+
+            st.dataframe(preview_df, use_container_width=True)
         sql_code = generate_migration_sql(struct["all_columns"])
         report_display_name = db_mig_info.get("name") if db_mig_info else struct["titles_text"]
         py_code = generate_migration_py(
@@ -895,8 +948,7 @@ elif "Robots de Migración" in mode:
                         st.error("Ingresa la contraseña de SSH para desplegar.")
                     else:
                         local_mig_dir = os.path.join(new_repo, "models", "migration", mig_parent_code)
-                        if not os.path.isdir(local_mig_dir):
-                            save_migration_files(new_repo, mig_parent_code, sel_report, sql_code, py_code)
+                        save_migration_files(new_repo, mig_parent_code, sel_report, sql_code, py_code)
                         
                         with st.spinner("Desplegando en el servidor..."):
                             deploy_res = deploy_robot_to_server(
