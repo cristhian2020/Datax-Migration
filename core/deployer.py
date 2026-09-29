@@ -309,14 +309,17 @@ def trigger_dag_on_server(
             country = parts[1] if len(parts) > 1 and len(parts[1]) == 2 else "BO"
             rep_clean = "_".join(parts[2:]) if len(parts) > 2 else report_code
 
-            cmd = f'''docker exec data-processing-platform-dev-airflow-worker-1 bash -c '
-LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1)
-if [ -z "$LAST_SQLITE" ]; then
-  LAST_SQLITE=$(find /mnt/datos1/data_process/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1)
-fi
-echo "Migrando archivo: $LAST_SQLITE"
-airflow dags trigger {dag_id} --conf "{{\"code\": \"{report_code}\", \"conversion_path\": \"$LAST_SQLITE\", \"id_conversion\": 1}}"
-' '''
+            bs = chr(92)
+            q = chr(34)
+            conf_str = f'--conf "{chr(123)}{bs}{q}code{bs}{q}: {bs}{q}{report_code}{bs}{q}, {bs}{q}conversion_path{bs}{q}: {bs}{q}$LAST_SQLITE{bs}{q}, {bs}{q}id_conversion{bs}{q}: 1{chr(125)}"'
+
+            bash_script = (
+                f'LAST_SQLITE=$(find /mnt/datos1/data_process/{country}/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
+                f'[ -z "$LAST_SQLITE" ] && LAST_SQLITE=$(find /mnt/datos1/data_process/ -type f -name "*{rep_clean}*.sqlite" 2>/dev/null | sort | tail -n 1); '
+                f'echo "Migrando archivo: $LAST_SQLITE"; '
+                f'airflow dags trigger {dag_id} {conf_str}'
+            )
+            cmd = f"docker exec data-processing-platform-dev-airflow-worker-1 bash -c '{bash_script}'"
         else:
             conf_json = json.dumps(conf or {})
             cmd = (
