@@ -180,12 +180,12 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
         else:
             suggested_unit = "BOB/USD"
     # 3. Tasas
-    elif "tasa" in full_norm or "tasas" in full_norm or "rendimiento" in full_norm:
+    elif ("tasa" in full_norm or "tasas" in full_norm or "rendimiento" in full_norm) and suggested_factor <= 1.0:
         suggested_metric = "tasa"
         suggested_unit = "%"
         suggested_factor = 1.0
     # 4. Porcentajes y ratios
-    elif "porcentaje" in full_norm or "%" in full_norm:
+    elif ("porcentaje" in full_norm or "%" in full_norm) and suggested_factor <= 1.0:
         suggested_metric = "porcentaje"
         suggested_unit = "%"
         suggested_factor = 1.0
@@ -238,14 +238,17 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
     has_monetary_kw = any(k in full_norm for k in [
         "bolivianos", "dolares", "dólares", "usd", "bob", " bs", "bs.", "moneda nacional", "moneda extranjera",
         "monto", "saldo", "cartera", "deposito", "depositos", "capital", "utilidad", "activo", "pasivo",
-        "patrimonio", "ingresos", "gastos", "credito", "creditos", "costo", "financiero"
+        "patrimonio", "ingresos", "gastos", "credito", "creditos", "costo", "financiero", "financiera",
+        "subasta", "bonos", "letras", "adjudicad", "tgn", "bcb"
     ])
+
+    has_reclamo_kw = any(k in full_norm for k in ["reclamo", "reclamos", "queja", "quejas", "sancion", "sanciones", "multa", "multas"])
 
     # 8/9. Conteo o Moneda: solo si ninguna categoría de la cadena anterior aplica
     if suggested_metric not in ["energia", "potencia", "tipo_cambio", "tasa", "porcentaje", "indice", "volumen", "temperatura", "precipitacion"]:
-        if has_count_kw and not has_monetary_kw:
+        if has_reclamo_kw or (has_count_kw and not has_monetary_kw and suggested_factor <= 1.0):
             suggested_metric = "conteo"
-            suggested_unit = "reclamos" if ("reclamo" in full_norm or "reclamos" in full_norm) else "unidades"
+            suggested_unit = "reclamos" if has_reclamo_kw else "unidades"
             suggested_factor = 1.0
         else:
             suggested_metric = "moneda"
@@ -563,7 +566,10 @@ class {report_code}(Migration_Base):
         dataframe.insert(idx_valor, column="metrica", value=dataframe.apply(get_metric, axis=1))
         dataframe.insert(idx_valor + 1, column="unidad_metrica", value=dataframe.apply(get_unit, axis=1))
 
-        dataframe["valor"] = pd.to_numeric(dataframe["valor"], errors="coerce")
+        dataframe["valor"] = pd.to_numeric(
+            dataframe["valor"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
 
         try:
             factor_val = float(conversion_factor) if conversion_factor is not None else {float(factor)}
@@ -609,9 +615,10 @@ class {report_code}(Migration_Base):
                     lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None
                 )
 
-        idx_valor = dataframe.columns.get_loc("valor")
-        dataframe.insert(idx_valor, column="metrica", value="{metric}")
-        dataframe.insert(idx_valor + 1, column="unidad_metrica", value="{unit}")
+        dataframe["valor"] = pd.to_numeric(
+            dataframe["valor"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
 
         try:
             factor_val = int(conversion_factor) if conversion_factor is not None else {factor_num}
@@ -622,6 +629,7 @@ class {report_code}(Migration_Base):
             factor_val = {factor_num}
 
         return ({{"conversion_factor": factor_val}}, dataframe)
+
 
 
 Robot = {report_code}
