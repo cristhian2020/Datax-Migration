@@ -72,6 +72,27 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
+def safe_dataframe(df: pd.DataFrame, use_container_width: bool = True, **kwargs):
+    """Muestra un DataFrame con st.dataframe o fallback a HTML estilizado si falla pyarrow."""
+    try:
+        st.dataframe(df, use_container_width=use_container_width, **kwargs)
+    except Exception:
+        html_table = df.to_html(classes="safe-table", index=False, na_rep="-", border=0)
+        styled_html = f"""
+        <div style="max-height: 420px; overflow: auto; border: 1px solid #334155; border-radius: 6px; padding: 4px; background-color: #0f172a; margin-bottom: 1rem;">
+            <style>
+                table.safe-table {{ width: 100%; border-collapse: collapse; font-family: sans-serif; font-size: 0.88rem; }}
+                table.safe-table th {{ background-color: #1e293b; color: #38bdf8; padding: 8px 10px; border-bottom: 1px solid #334155; text-align: left; position: sticky; top: 0; z-index: 1; }}
+                table.safe-table td {{ padding: 6px 10px; border-bottom: 1px solid #1e293b; color: #f1f5f9; }}
+                table.safe-table tr:hover {{ background-color: #1e293b88; }}
+            </style>
+            {html_table}
+        </div>
+        """
+        st.markdown(styled_html, unsafe_allow_html=True)
+
+
 # ─── SIDEBAR ───────────────────────────────────────────────────
 st.sidebar.title("🚀 Datax Studio")
 st.sidebar.markdown("**Centro de Migración V1 ➔ V2**")
@@ -144,7 +165,7 @@ with st.sidebar.expander("🐙 Conexión GitHub (Pasantes)", expanded=False):
 mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "🚚 Robots de Migración", "📦 Migración por Lote", "🚀 Despliegue al Servidor"])
 
 # ─── PESTAÑA 1: DESCARGA ───────────────────────────────────────
-if mode == "📥 Robots de Descarga":
+if "Robots de Descarga" in mode:
     st.header("📥 Migración de Robots de Descarga (`D_...`)")
     st.caption("Estandarización automática a V2 (Download_Base, Tipo I-IV, Playwright y creación de DAGs).")
 
@@ -225,7 +246,7 @@ if mode == "📥 Robots de Descarga":
                         st.write(l)
 
 # ─── PESTAÑA 2: CONVERSIÓN (ASISTENTE POR PASOS) ───────────────
-elif mode == "🔄 Robots de Conversión":
+elif "Robots de Conversión" in mode:
     st.header("🔄 Asistente por Pasos: Migración de Conversión (`C_...`)")
     st.caption("Flujo guiado y seguro de 5 pasos para extraer, auditar datos (NVx/fecha/valor), configurar plantilla y desplegar al servidor.")
 
@@ -598,7 +619,7 @@ elif mode == "🔄 Robots de Conversión":
             if df_sqlite is not None:
                 st.success(f"Se cargaron **{len(df_sqlite)}** filas del archivo: `{sq_path_found}`")
                 st.markdown("**Columnas detectadas:** " + ", ".join([f"`{c}`" for c in df_sqlite.columns]))
-                st.dataframe(df_sqlite, use_container_width=True)
+                safe_dataframe(df_sqlite, use_container_width=True)
                 
                 # Verificación de columnas de nivel
                 nv_cols = [c for c in df_sqlite.columns if c.lower().startswith("nv") or "nivel" in c.lower() or "categoria" in c.lower()]
@@ -624,7 +645,7 @@ elif mode == "🔄 Robots de Conversión":
                 )
                 if df_repl is not None:
                     st.success(f"Tabla `{repl_tbl_name}`: **{len(df_repl)}** registros cargados.")
-                    st.dataframe(df_repl, use_container_width=True)
+                    safe_dataframe(df_repl, use_container_width=True)
                 else:
                     st.warning(f"No se pudieron cargar datos de la tabla de reemplazos `{repl_tbl_name}`.")
                     if err_repl:
@@ -823,22 +844,23 @@ elif "Robots de Migración" in mode:
             col_c1, col_c2 = st.columns(2)
             with col_c1:
                 metric_options = [
-                    "moneda", "energia", "potencia", "porcentaje", "indice", "volumen", 
-                    "tasa", "tipo_cambio", "ratio", "temperatura", "precipitacion", "conteo"
+                    "conteo", "moneda", "porcentaje", "energia", "potencia", "indice", "volumen", 
+                    "tasa", "tipo_cambio", "ratio", "temperatura", "precipitacion"
                 ]
                 def_metric_idx = metric_options.index(struct["suggested_metric"]) if struct["suggested_metric"] in metric_options else 0
                 chosen_metric = st.selectbox("Métrica Base:", metric_options, index=def_metric_idx)
                 
                 common_units = [
+                    "unidades", "reclamos", "personas", "casos", "cuentas", "transacciones", "operaciones",
                     "BOB", "USD", "UFV", "BOB/USD", "BOB/UFV", "%", "veces", "puntos",
                     "GWh", "MWh", "kWh", "Wh", "GW", "MW", "kW",
-                    "Tn", "Kg", "m3", "MMpcd", "Bbl", "litros", "unidades", "personas", "°C", "mm"
+                    "Tn", "Kg", "m3", "MMpcd", "Bbl", "litros", "°C", "mm"
                 ]
                 sug_u = struct["suggested_unit"]
                 if sug_u not in common_units:
                     common_units.insert(0, sug_u)
                 chosen_unit = st.selectbox("Unidad Métrica Base:", common_units, index=common_units.index(sug_u) if sug_u in common_units else 0, help="Unidad predominante del reporte.")
-                custom_unit = st.text_input("✍️ O escribir otra unidad personalizada (opcional):", value="", placeholder="Ej: GWh, MWh, Bbl, etc.")
+                custom_unit = st.text_input("✍️ O escribir otra unidad personalizada (opcional):", value="", placeholder="Ej: reclamos, unidades, GWh, etc.")
                 if custom_unit.strip():
                     chosen_unit = custom_unit.strip()
 
@@ -846,12 +868,22 @@ elif "Robots de Migración" in mode:
                 default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else struct["suggested_factor"]
                 chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0)
                 is_mixed = st.checkbox(
-                    "💱 Mapeo dinámico de Monedas (BOB, USD, UFV, BOB/USD) y Ratios (%)",
-                    value=struct["has_mixed_rows"] or struct.get("has_multi_currency", False),
-                    help="Detecta fila por fila si el valor corresponde a BOB, USD, UFV, Tipo de Cambio o Porcentaje y aplica el escalado selectivo sobre filas monetarias."
+                    "🔀 Mapeo dinámico de Múltiples Hechos (Conteo, Porcentaje %, Monedas BOB/USD/UFV, etc.)",
+                    value=struct["has_mixed_rows"] or struct.get("has_multi_currency", False) or struct.get("has_multiple_facts", False),
+                    help="Detecta fila por fila si el valor corresponde a Porcentaje %, Moneda (BOB, USD, UFV), Tipo de Cambio, etc. y clasifica automáticamente cada fila."
                 )
-            if struct.get("has_multi_currency"):
+            if struct.get("detected_facts") and len(struct["detected_facts"]) > 1:
+                facts_md = "\n".join([
+                    f"**Hecho {i+1}:** `{f['metrica']}` · `{f['unidad']}` — {f.get('etiqueta', '')}"
+                    for i, f in enumerate(struct["detected_facts"])
+                ])
+                st.info(
+                    f"🎯 **{len(struct['detected_facts'])} Hechos / Métricas detectados automáticamente en este reporte:**\n\n{facts_md}\n\n"
+                    f"_El mapeo dinámico está activo y clasificará cada fila según el texto de sus columnas._"
+                )
+            elif struct.get("has_multi_currency"):
                 st.info(f"💱 **Múltiples monedas detectadas en las filas:** `{'`, `'.join(struct['detected_currencies'])}` (El robot asignará dinámicamente cada moneda a su respectiva fila).")
+
             st.markdown("#### 📋 Columnas Detectadas en SQLite y Estructura de Migración")
             st.success(f"**Columnas completas para PostgreSQL ({len(struct['all_columns'])}):** `{struct['all_columns']}`")
             col_s1, col_s2 = st.columns(2)
@@ -868,7 +900,7 @@ elif "Robots de Migración" in mode:
                 def preview_get_metric(row):
                     texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
                     combined = " ".join(texts)
-                    if "%" in combined or "PARTICIPACI" in combined:
+                    if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                         return "porcentaje"
                     if "VECES" in combined or "RATIO" in combined:
                         return "ratio"
@@ -882,12 +914,20 @@ elif "Robots de Migración" in mode:
                         return "energia"
                     if any(tok in combined for tok in ["POTENCIA", " MW", "(MW)", " GW", "(GW)", " KW", "(KW)"]):
                         return "potencia"
+                    for t in texts:
+                        words = set(re.split(r"[\s/()]+", t))
+                        if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in t or "DEL EXTERIOR" in t:
+                            return "moneda"
+                        if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in t:
+                            return "moneda"
+                        if "UFV" in words:
+                            return "moneda"
                     return chosen_metric
 
                 def preview_get_unit(row):
                     texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
                     combined = " ".join(texts)
-                    if "%" in combined or "PARTICIPACI" in combined:
+                    if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                         return "%"
                     if "VECES" in combined or "RATIO" in combined:
                         return "veces"
@@ -931,7 +971,7 @@ elif "Robots de Migración" in mode:
                 preview_df.insert(idx_val, "metrica_preview", chosen_metric)
                 preview_df.insert(idx_val + 1, "unidad_preview", chosen_unit)
 
-            st.dataframe(preview_df, use_container_width=True)
+            safe_dataframe(preview_df, use_container_width=True)
         sql_code = generate_migration_sql(struct["all_columns"])
         report_display_name = db_mig_info.get("name") if db_mig_info else struct["titles_text"]
         py_code = generate_migration_py(
@@ -1050,7 +1090,7 @@ elif "Robots de Migración" in mode:
                         with st.expander("Ver logs de disparo de Airflow", expanded=True):
                             st.code(trig_res["output"] or "Sin salida de terminal.")
 
-elif mode == "📊 Migración por Lote":
+elif "Migración por Lote" in mode:
     st.header("📊 Migración Masiva por Lote (Batch)")
     st.caption("Migra múltiples robots de descarga o conversión de una sola vez.")
 
@@ -1080,11 +1120,11 @@ elif mode == "📊 Migración por Lote":
                 progress_bar.progress((i + 1) / len(dl_robots))
 
             status_text.success("¡Proceso por lote completado!")
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
+            safe_dataframe(pd.DataFrame(results), use_container_width=True)
 
 
 # ─── PESTAÑA 4: DESPLIEGUE AL SERVIDOR ────────────────────────
-elif mode == "🚀 Despliegue al Servidor":
+elif "Despliegue al Servidor" in mode:
     st.header("☁️ Despliegue Automatizado al Servidor Remoto (10.0.0.16)")
     st.caption("Transfiere los robots migrados desde tu máquina al servidor y ejecuta el generador de DAGs en Docker.")
 

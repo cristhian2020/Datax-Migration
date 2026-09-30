@@ -101,7 +101,7 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
             table_name = tables[0] if tables else ""
         cursor.execute(f'PRAGMA table_info("{table_name}");')
         pragma_cols = [row[1] for row in cursor.fetchall()]
-        df = pd.read_sql_query(f'SELECT * FROM "{table_name}" LIMIT 200;', conn)
+        df = pd.read_sql_query(f'SELECT * FROM "{table_name}";', conn)
 
     df.columns = [standardize_col_name(c) if str(c).lower().strip() != 'file' else 'file' for c in df.columns]
     cols_clean = [standardize_col_name(c) for c in pragma_cols if str(c).lower().strip() != 'file']
@@ -133,6 +133,10 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
     # Deteccion de moneda base y tipos de cambio
     has_usd_kw = any(k in full_norm for k in ["dolares", "usd", "$us", "moneda extranjera", "del exterior"])
     has_bob_kw = any(k in full_norm for k in ["bolivianos", "bob", "moneda nacional", " bs", "bs."])
+
+    # Inicializar sugerencias de métrica/unidad
+    suggested_metric = None
+    suggested_unit = None
 
     # 1. Energia y Potencia Electrica (GWh, MWh, kWh, Wh, GW, MW, kW)
     if re.search(r'[\(\[\s]gwh[\)\]\s]|\bgwh\b', titles_norm) or re.search(r'[\(\[\s]gwh[\)\]\s]|\bgwh\b', full_norm):
@@ -221,21 +225,54 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
         suggested_metric = "precipitacion"
         suggested_unit = "mm"
         suggested_factor = 1.0
-    # 8. Moneda por defecto
-    else:
-        suggested_metric = "moneda"
-        suggested_unit = "USD" if (has_usd_kw and not has_bob_kw) else "BOB"
+    # 8. Conteo / Reclamos / Cantidades / Transacciones / Personas / Unidades
+    count_keywords = [
+        "reclamo", "reclamos", "queja", "quejas", "sancion", "sanciones", "multa", "multas",
+        "solicitud", "solicitudes", "transaccion", "transacciones", "operacion", "operaciones",
+        "conteo", "cantidad", "numero de", "nro de", "nro.", "nro ", "total de",
+        "personas", "casos", "clientes", "cuentas", "usuarios", "afiliados", "empleados",
+        "trabajadores", "beneficiarios", "poblacion", "unidades", "licencias", "polizas",
+        "contratos", "visitas", "llamadas"
+    ]
+    has_count_kw = any(k in full_norm for k in count_keywords)
+    has_monetary_kw = any(k in full_norm for k in [
+        "bolivianos", "dolares", "dólares", "usd", "bob", " bs", "bs.", "moneda nacional", "moneda extranjera",
+        "monto", "saldo", "cartera", "deposito", "depositos", "capital", "utilidad", "activo", "pasivo",
+        "patrimonio", "ingresos", "gastos", "credito", "creditos", "costo", "financiero"
+    ])
 
-    # Deteccion de monedas multiples, energia y filas hibridas
+    # 8/9. Conteo o Moneda: solo si ninguna categoría de la cadena anterior aplica
+    if suggested_metric not in ["energia", "potencia", "tipo_cambio", "tasa", "porcentaje", "indice", "volumen", "temperatura", "precipitacion"]:
+        if has_count_kw and not has_monetary_kw:
+            suggested_metric = "conteo"
+            suggested_unit = "reclamos" if ("reclamo" in full_norm or "reclamos" in full_norm) else "unidades"
+            suggested_factor = 1.0
+        else:
+            suggested_metric = "moneda"
+            suggested_unit = "USD" if (has_usd_kw and not has_bob_kw) else "BOB"
+
+
+    # Deteccion de hechos multiples (facts/metricas), monedas, energia y filas hibridas
     detected_currencies = set()
     has_mixed_rows = False
+    found_percent = False
+    found_ratio = False
+    found_tasa = False
+    found_energy = set()
+    found_count_in_rows = False
+    found_indice_secondary = False
+    detected_indice_unit = "puntos"
 
-    for col in nv_cols:
+    # Escanear nv_cols Y title_cols para detectar hechos adicionales en filas
+    for col in (nv_cols + title_cols):
         if col in df.columns:
-            str_vals = df[col].dropna().astype(str).tolist()
+            str_vals = df[col].dropna().astype(str).unique().tolist()
             for v in str_vals:
                 vu = v.upper()
+                vl = v.lower()
                 words = set(re.split(r'[\s/()]+', vu))
+
+                # Detección de monedas en filas
                 if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in vu:
                     detected_currencies.add("BOB")
                 if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in vu:
@@ -247,24 +284,116 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
                 if "BS/UFV" in vu or "BOB/UFV" in vu or ("TIPO DE CAMBIO" in vu and "UFV" in words):
                     detected_currencies.add("BOB/UFV")
 
-                # Deteccion de unidades de energia/potencia en filas
+                # Detección de unidades de energía/potencia en filas
                 if "GWH" in words:
                     detected_currencies.add("GWh")
+                    found_energy.add("GWh")
                 if "MWH" in words:
                     detected_currencies.add("MWh")
+                    found_energy.add("MWh")
                 if "KWH" in words:
                     detected_currencies.add("kWh")
+                    found_energy.add("kWh")
                 if "MW" in words:
                     detected_currencies.add("MW")
+                    found_energy.add("MW")
                 if "KW" in words:
                     detected_currencies.add("kW")
+                    found_energy.add("kW")
 
-                vl = v.lower()
-                if "%" in vl or "participaci" in vl or "veces" in vl or "ratio" in vl:
-                    has_mixed_rows = True
+                # Detección de porcentajes, tasas y ratios
+                if "%" in vl or "porcentaj" in vl or "participaci" in vl or "proporcion" in vl:
+                    found_percent = True
+                if "veces" in vl or "ratio" in vl:
+                    found_ratio = True
+                if "tasa" in vl or "rendimiento" in vl or "tre(%)" in vl or "tea(%)" in vl:
+                    found_tasa = True
+                # Detección de índice como hecho secundario (en nv_cols)
+                if "indice" in vl or "\u00edndice" in vl or "igae" in vl or "ipc" in vl:
+                    if suggested_metric not in ["indice"]:
+                        found_indice_secondary = True
+                        match_ib = re.search(r'(\d{4}\s*=\s*100)', vl)
+                        if match_ib:
+                            detected_indice_unit = match_ib.group(1).replace(" ", "")
+                # Detección de conteo en filas de nv_cols
+                if col in nv_cols and any(tok in vl for tok in ["cantidad", "numero", "nro", "reclamo", "queja", "solicitud", "operacion", "transaccion", "personas", "casos", "cuentas"]):
+                    found_count_in_rows = True
+
+    # Estructurar hechos detectados (fact/metric dimensional)
+    detected_facts = []
+
+    # Hecho 1: Hecho base predominante
+    detected_facts.append({
+        "metrica": suggested_metric,
+        "unidad": suggested_unit,
+        "etiqueta": f"Base ({suggested_metric.capitalize()} / {suggested_unit})"
+    })
+
+    # Hechos adicionales detectados en filas
+    if found_percent and suggested_metric != "porcentaje":
+        detected_facts.append({
+            "metrica": "porcentaje",
+            "unidad": "%",
+            "etiqueta": "Porcentaje / Participación (%)"
+        })
+        has_mixed_rows = True
+
+    if found_ratio and suggested_metric != "ratio":
+        detected_facts.append({
+            "metrica": "ratio",
+            "unidad": "veces",
+            "etiqueta": "Ratio (veces)"
+        })
+        has_mixed_rows = True
+
+    if found_tasa and suggested_metric != "tasa":
+        detected_facts.append({
+            "metrica": "tasa",
+            "unidad": "%",
+            "etiqueta": "Tasa (%)"
+        })
+        has_mixed_rows = True
+
+    if found_indice_secondary and suggested_metric not in ["indice", "porcentaje"]:
+        detected_facts.append({
+            "metrica": "indice",
+            "unidad": detected_indice_unit,
+            "etiqueta": f"Índice ({detected_indice_unit})"
+        })
+        has_mixed_rows = True
+
+    if len(detected_currencies) > 1:
+        has_mixed_rows = True
+        for curr in sorted(detected_currencies):
+            if curr != suggested_unit:
+                detected_facts.append({
+                    "metrica": "moneda" if curr in ["BOB", "USD", "UFV"] else "tipo_cambio",
+                    "unidad": curr,
+                    "etiqueta": f"Moneda / Divisa ({curr})"
+                })
+    elif len(detected_currencies) == 1 and suggested_metric != "moneda":
+        curr = list(detected_currencies)[0]
+        detected_facts.append({
+            "metrica": "moneda",
+            "unidad": curr,
+            "etiqueta": f"Moneda ({curr})"
+        })
+        has_mixed_rows = True
+
+    if found_energy:
+        for en in sorted(found_energy):
+            if en != suggested_unit:
+                m_type = "potencia" if en in ["MW", "GW", "kW"] else "energia"
+                detected_facts.append({
+                    "metrica": m_type,
+                    "unidad": en,
+                    "etiqueta": f"{m_type.capitalize()} ({en})"
+                })
+                has_mixed_rows = True
 
     has_multi_currency = len(detected_currencies) > 1
-    if has_multi_currency:
+    has_multiple_facts = len(detected_facts) > 1
+    if has_multiple_facts:
         has_mixed_rows = True
 
     return {
@@ -277,9 +406,11 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
         "suggested_factor": suggested_factor,
         "has_mixed_rows": has_mixed_rows,
         "has_multi_currency": has_multi_currency,
+        "has_multiple_facts": has_multiple_facts,
+        "detected_facts": detected_facts,
         "detected_currencies": sorted(list(detected_currencies)),
         "titles_text": combined_titles.strip(),
-        "sample_df": df.head(10)
+        "sample_df": df
     }
 
 
@@ -365,7 +496,7 @@ class {report_code}(Migration_Base):
         def get_metric(row) -> str:
             texts = [str(row.get(c, "")).upper() for c in reversed({clean_cols})]
             combined = " ".join(texts)
-            if "%" in combined or "PARTICIPACI" in combined:
+            if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                 return "porcentaje"
             if "VECES" in combined or "RATIO" in combined:
                 return "ratio"
@@ -379,12 +510,20 @@ class {report_code}(Migration_Base):
                 return "energia"
             if any(tok in combined for tok in ["POTENCIA", " MW", "(MW)", " GW", "(GW)", " KW", "(KW)"]):
                 return "potencia"
+            for t in texts:
+                words = set(re.split(r"[\\s/()]+", t))
+                if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in t or "DEL EXTERIOR" in t:
+                    return "moneda"
+                if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in t:
+                    return "moneda"
+                if "UFV" in words:
+                    return "moneda"
             return "{metric}"
 
         def get_unit(row) -> str:
             texts = [str(row.get(c, "")).upper() for c in reversed({clean_cols})]
             combined = " ".join(texts)
-            if "%" in combined or "PARTICIPACI" in combined:
+            if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                 return "%"
             if "VECES" in combined or "RATIO" in combined:
                 return "veces"
