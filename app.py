@@ -3,6 +3,7 @@
 import os
 import sys
 import re
+import importlib
 import streamlit as st
 import pandas as pd
 
@@ -11,7 +12,13 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
+import core.agent_analyzer
+import core.migrator_migration
+importlib.reload(core.agent_analyzer)
+importlib.reload(core.migrator_migration)
+from core.agent_analyzer import run_agent_sqlite_analysis, parse_commodity_price_unit
 from core.config import (
+    DEFAULT_GEMINI_API_KEY,
     DEFAULT_OLD_REPO,
     DEFAULT_NEW_REPO,
     DEFAULT_DB_HOST,
@@ -165,6 +172,18 @@ with st.sidebar.expander("🐙 Conexión GitHub (Pasantes)", expanded=False):
                 st.success("Guardado en .env")
             except Exception as ex:
                 st.error(f"Error: {ex}")
+
+
+with st.sidebar.expander("🤖 Agente IA (Google Gemini)", expanded=False):
+    gemini_api_key = st.text_input(
+        "Gemini API Key:",
+        value=st.session_state.get("gemini_api_key", DEFAULT_GEMINI_API_KEY),
+        type="password",
+        help="Obtén tu API key gratuita en: https://aistudio.google.com/app/apikey",
+        key="sidebar_gemini_key"
+    )
+    st.session_state["gemini_api_key"] = gemini_api_key
+    st.caption("ℹ️ *Si no se ingresa clave, el Agente usará el Motor Heurístico Avanzado de forma 100% offline.*")
 
 mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "🚚 Robots de Migración", "📦 Migración por Lote", "🚀 Despliegue al Servidor"])
 
@@ -1070,35 +1089,79 @@ elif "Robots de Migración" in mode:
         ])
 
         with tab_cfg:
+            st.markdown("#### 🤖 Agente Analizador Inteligente de SQLite (Gemini / Heurístico)")
+            st.caption("El Agente examina títulos, jerarquías multinivel, categorías únicas y la distribución numérica en SQLite para clasificar exactamente métricas homogéneas o mixtas (tasa, moneda, %, BOB, USD, UFV) y el factor de conversión correspondiente.")
+
+            agent_state_key = f"agent_res_{sel_report}"
+            col_ag1, col_ag2, col_ag3 = st.columns([2, 1, 1])
+            with col_ag1:
+                run_agent_btn = st.button("🧠 Ejecutar Análisis con Agente IA", key=f"btn_ag_{sel_report}", use_container_width=True)
+            with col_ag2:
+                re_run_btn = st.button("🔄 Re-analizar", key=f"btn_reag_{sel_report}", use_container_width=True, help="Limpia el resultado anterior y vuelve a consultar al Agente IA.")
+            with col_ag3:
+                auto_agent = st.checkbox("Analizar al cargar", value=False, key=f"auto_ag_{sel_report}")
+
+            if run_agent_btn or re_run_btn or (auto_agent and agent_state_key not in st.session_state):
+                with st.spinner("El Agente IA está analizando títulos, jerarquías y datos del SQLite..."):
+                    agent_res = run_agent_sqlite_analysis(
+                        sqlite_path=sqlite_file,
+                        api_key=st.session_state.get("gemini_api_key", DEFAULT_GEMINI_API_KEY)
+                    )
+                    st.session_state[agent_state_key] = agent_res
+                    # Sincronizar explícitamente los controles de la UI:
+                    st.session_state[f"cb_mixed_{sel_report}"] = bool(agent_res.get("is_mixed", True))
+                    st.session_state[f"metric_{sel_report}"] = agent_res.get("base_metric", "precio")
+                    st.session_state[f"unit_{sel_report}"] = agent_res.get("base_unit", "GBP/Tn")
+                    st.session_state[f"factor_{sel_report}"] = float(agent_res.get("conversion_factor", 1.0))
+                    st.rerun()
+
+            agent_data = st.session_state.get(agent_state_key, {})
+            custom_m = agent_data.get("get_metric_code", "") if agent_data else ""
+            custom_u = agent_data.get("get_unit_code", "") if agent_data else ""
+            if agent_data and "explanation" in agent_data:
+                src_badge = "Google Gemini API 🚀" if "gemini" in str(agent_data.get("source", "")).lower() else "Motor Heurístico Avanzado ⚡"
+                st.info(f"💡 **Diagnóstico del Agente IA ({src_badge}):**\n\n{agent_data.get('explanation', '')}")
+                if agent_data.get("agent_warning"):
+                    st.warning(agent_data["agent_warning"])
+
+            # Valores efectivos priorizados por el Agente si ya analizó:
+            effective_metric = agent_data.get("base_metric", struct["suggested_metric"])
+            effective_unit = agent_data.get("base_unit", struct["suggested_unit"])
+            effective_factor = agent_data.get("conversion_factor", struct["suggested_factor"])
+            effective_is_mixed = agent_data.get("is_mixed", (struct["has_mixed_rows"] or struct.get("has_multi_currency", False) or struct.get("has_multiple_facts", False)))
+
             col_c1, col_c2 = st.columns(2)
             with col_c1:
                 metric_options = [
-                    "conteo", "moneda", "porcentaje", "energia", "potencia", "indice", "volumen", 
-                    "tasa", "tipo_cambio", "ratio", "temperatura", "precipitacion"
+                    "precio", "tasa", "moneda", "porcentaje", "tipo_cambio", "volumen", 
+                    "energia", "potencia", "indice", "ratio", "conteo", "temperatura", "precipitacion"
                 ]
-                def_metric_idx = metric_options.index(struct["suggested_metric"]) if struct["suggested_metric"] in metric_options else 0
-                chosen_metric = st.selectbox("Métrica Base:", metric_options, index=def_metric_idx)
+                if effective_metric not in metric_options:
+                    metric_options.insert(0, effective_metric)
+                def_metric_idx = metric_options.index(effective_metric) if effective_metric in metric_options else 0
+                chosen_metric = st.selectbox("Métrica Base:", metric_options, index=def_metric_idx, key=f"metric_{sel_report}")
                 
                 common_units = [
-                    "unidades", "reclamos", "personas", "casos", "cuentas", "transacciones", "operaciones",
+                    "USD/Tn", "GBP/Tn", "EUR/Tn", "USD/Bbl", "USc/lb",
                     "BOB", "USD", "UFV", "BOB/USD", "BOB/UFV", "%", "veces", "puntos",
+                    "unidades", "reclamos", "personas", "casos", "cuentas", "transacciones", "operaciones",
                     "GWh", "MWh", "kWh", "Wh", "GW", "MW", "kW",
                     "Tn", "Kg", "m3", "MMpcd", "Bbl", "litros", "°C", "mm"
                 ]
-                sug_u = struct["suggested_unit"]
-                if sug_u not in common_units:
-                    common_units.insert(0, sug_u)
-                chosen_unit = st.selectbox("Unidad Métrica Base:", common_units, index=common_units.index(sug_u) if sug_u in common_units else 0, help="Unidad predominante del reporte.")
+                if effective_unit not in common_units:
+                    common_units.insert(0, effective_unit)
+                chosen_unit = st.selectbox("Unidad Métrica Base:", common_units, index=common_units.index(effective_unit) if effective_unit in common_units else 0, key=f"unit_{sel_report}", help="Unidad predominante del reporte.")
                 custom_unit = st.text_input("✍️ O escribir otra unidad personalizada (opcional):", value="", placeholder="Ej: reclamos, unidades, GWh, etc.")
                 if custom_unit.strip():
                     chosen_unit = custom_unit.strip()
 
             with col_c2:
-                default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else struct["suggested_factor"]
-                chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0)
+                default_factor = float(db_mig_info.get("conversion_factor")) if (db_mig_info and db_mig_info.get("conversion_factor")) else effective_factor
+                chosen_factor = st.number_input("Factor de Conversión:", value=float(default_factor), step=1.0, key=f"factor_{sel_report}")
                 is_mixed = st.checkbox(
                     "🔀 Mapeo dinámico de Múltiples Hechos (Conteo, Porcentaje %, Monedas BOB/USD/UFV, etc.)",
-                    value=struct["has_mixed_rows"] or struct.get("has_multi_currency", False) or struct.get("has_multiple_facts", False),
+                    value=effective_is_mixed,
+                    key=f"cb_mixed_{sel_report}",
                     help="Detecta fila por fila si el valor corresponde a Porcentaje %, Moneda (BOB, USD, UFV), Tipo de Cambio, etc. y clasifica automáticamente cada fila."
                 )
             if struct.get("detected_facts") and len(struct["detected_facts"]) > 1:
@@ -1129,6 +1192,10 @@ elif "Robots de Migración" in mode:
                 def preview_get_metric(row):
                     texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
                     combined = " ".join(texts)
+                    for t in texts:
+                        p_unit = parse_commodity_price_unit(t)
+                        if p_unit:
+                            return "precio"
                     if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                         return "porcentaje"
                     if "VECES" in combined or "RATIO" in combined:
@@ -1156,6 +1223,10 @@ elif "Robots de Migración" in mode:
                 def preview_get_unit(row):
                     texts = [str(row.get(c, "")).upper() for c in reversed(struct["nv_cols"] + struct["title_cols"])]
                     combined = " ".join(texts)
+                    for t in texts:
+                        p_unit = parse_commodity_price_unit(t)
+                        if p_unit:
+                            return p_unit
                     if any(tok in combined for tok in ["%", "PORCENTAJ", "PARTICIPACI", "PROPORCION"]):
                         return "%"
                     if "VECES" in combined or "RATIO" in combined:
@@ -1192,6 +1263,18 @@ elif "Robots de Migración" in mode:
                             return "BOB"
                     return chosen_unit
 
+                # Si el Agente proporcionó código personalizado para get_metric y get_unit, usarlo en la simulación:
+                if custom_m and custom_u:
+                    try:
+                        agent_ns = {}
+                        exec(custom_m, {"pd": pd, "re": re}, agent_ns)
+                        exec(custom_u, {"pd": pd, "re": re}, agent_ns)
+                        if "get_metric" in agent_ns and "get_unit" in agent_ns:
+                            preview_get_metric = agent_ns["get_metric"]
+                            preview_get_unit = agent_ns["get_unit"]
+                    except Exception as _ex_ag:
+                        pass
+
                 idx_val = preview_df.columns.get_loc("valor") if "valor" in preview_df.columns else len(preview_df.columns)
                 preview_df.insert(idx_val, "metrica_preview", preview_df.apply(preview_get_metric, axis=1))
                 preview_df.insert(idx_val + 1, "unidad_preview", preview_df.apply(preview_get_unit, axis=1))
@@ -1203,6 +1286,8 @@ elif "Robots de Migración" in mode:
             safe_dataframe(preview_df, use_container_width=True)
         sql_code = generate_migration_sql(struct["all_columns"])
         report_display_name = db_mig_info.get("name") if db_mig_info else struct["titles_text"]
+        custom_m = agent_data.get("get_metric_code", "") if (agent_data and is_mixed) else ""
+        custom_u = agent_data.get("get_unit_code", "") if (agent_data and is_mixed) else ""
         py_code = generate_migration_py(
             report_code=sel_report,
             report_name=report_display_name,
@@ -1210,7 +1295,9 @@ elif "Robots de Migración" in mode:
             metric=chosen_metric,
             unit=chosen_unit,
             factor=chosen_factor,
-            has_mixed_rows=is_mixed
+            has_mixed_rows=is_mixed,
+            custom_metric_code=custom_m,
+            custom_unit_code=custom_u
         )
 
         with tab_preview:

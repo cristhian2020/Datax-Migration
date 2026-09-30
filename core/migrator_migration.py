@@ -1,3 +1,4 @@
+from core.agent_analyzer import parse_commodity_price_unit
 import unicodedata
 """Lógica de generación y preparación de robots y DAGs de migración (PostgreSQL / Airflow V2)."""
 
@@ -123,6 +124,15 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
     full_norm = unicodedata.normalize('NFD', full_header_text).encode('ascii', 'ignore').decode('utf-8')
     titles_norm = unicodedata.normalize('NFD', combined_titles_lower).encode('ascii', 'ignore').decode('utf-8')
 
+    # Deteccion de Precios / Cotizaciones de Commodities por unidad fisica (USD/Tn, GBP/Tn, EUR/Tn, etc.)
+    commodity_price_units = []
+    for c in nv_cols + aux_cols:
+        if c in df.columns:
+            for v in df[c].dropna().unique():
+                pu = parse_commodity_price_unit(str(v))
+                if pu and pu not in commodity_price_units:
+                    commodity_price_units.append(pu)
+
     # Deteccion de factor sugerido
     suggested_factor = 1.0
     if "millones" in full_norm:
@@ -245,7 +255,13 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
     has_reclamo_kw = any(k in full_norm for k in ["reclamo", "reclamos", "queja", "quejas", "sancion", "sanciones", "multa", "multas"])
 
     # 8/9. Conteo o Moneda: solo si ninguna categoría de la cadena anterior aplica
-    if suggested_metric not in ["energia", "potencia", "tipo_cambio", "tasa", "porcentaje", "indice", "volumen", "temperatura", "precipitacion"]:
+    if commodity_price_units:
+        suggested_metric = "precio"
+        suggested_unit = commodity_price_units[0]
+        suggested_factor = 1.0
+        if len(commodity_price_units) > 1:
+            has_mixed_rows = True
+    elif suggested_metric not in ["energia", "potencia", "tipo_cambio", "tasa", "porcentaje", "indice", "volumen", "temperatura", "precipitacion"]:
         if has_reclamo_kw or (has_count_kw and not has_monetary_kw and suggested_factor <= 1.0):
             suggested_metric = "conteo"
             suggested_unit = "reclamos" if has_reclamo_kw else "unidades"
@@ -394,9 +410,9 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
                 })
                 has_mixed_rows = True
 
-    has_multi_currency = len(detected_currencies) > 1
-    has_multiple_facts = len(detected_facts) > 1
-    if has_multiple_facts:
+    has_multi_currency = len(detected_currencies) > 1 or len(commodity_price_units) > 1
+    has_multiple_facts = len(detected_facts) > 1 or len(commodity_price_units) > 1
+    if has_multiple_facts or len(commodity_price_units) > 1:
         has_mixed_rows = True
 
     return {
@@ -465,13 +481,79 @@ def generate_migration_py(
     metric: str,
     unit: str,
     factor: float,
-    has_mixed_rows: bool = False
+    has_mixed_rows: bool = False,
+    custom_metric_code: str = "",
+    custom_unit_code: str = ""
 ) -> str:
-    clean_cols = [c for c in columns if c not in ["fecha", "valor"]]
+    clean_cols = [standardize_col_name(c) for c in columns if c not in ["fecha", "valor", "file", "id"]]
     factor_num = int(factor) if factor == int(factor) else factor
     rep_title = report_name or "Estandarizacion y carga a PostgreSQL"
 
-    if has_mixed_rows:
+    # 1. Si el Agente Inteligente generó código de mapeo personalizado:
+    if custom_metric_code.strip() and custom_unit_code.strip():
+        def indent_code(code_str: str, spaces: int = 8) -> str:
+            lines = code_str.strip().splitlines()
+            return chr(10).join(" " * spaces + l for l in lines)
+
+        indented_metric = indent_code(custom_metric_code)
+        indented_unit = indent_code(custom_unit_code)
+
+        return f'''"""Migration robot for report {report_code}: {rep_title}."""
+
+import re
+from typing import Tuple
+import pandas as pd
+from models.migration.Migration_Base import Migration_Base
+
+
+class {report_code}(Migration_Base):
+    """Migration robot for {report_code}."""
+
+    def standard_report(self, dataframe: pd.DataFrame, conversion_factor: int) -> Tuple[dict, pd.DataFrame]:
+        """
+        Enrich dataframe with metric and metric unit metadata (Generado con Agente Inteligente DATAX).
+        """
+        dataframe.columns = [re.sub(r"[\\t\\xa0]+", "", str(c)).strip() for c in dataframe.columns]
+
+        for col in dataframe.columns:
+            if col not in ["valor", "fecha"]:
+                dataframe[col] = dataframe[col].apply(
+                    lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None
+                )
+
+{indented_metric}
+
+{indented_unit}
+
+        idx_valor = dataframe.columns.get_loc("valor")
+        dataframe.insert(idx_valor, column="metrica", value=dataframe.apply(get_metric, axis=1))
+        dataframe.insert(idx_valor + 1, column="unidad_metrica", value=dataframe.apply(get_unit, axis=1))
+
+        dataframe["valor"] = pd.to_numeric(
+            dataframe["valor"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
+
+        try:
+            factor_val = float(conversion_factor) if conversion_factor is not None else {float(factor)}
+        except (ValueError, TypeError):
+            factor_val = {float(factor)}
+
+        if factor_val <= 1.0 and {float(factor)} > 1.0:
+            factor_val = {float(factor)}
+
+        if factor_val > 1.0:
+            mask_moneda = dataframe["metrica"] == "moneda"
+            dataframe.loc[mask_moneda, "valor"] = dataframe.loc[mask_moneda, "valor"] * factor_val
+
+        return ({{"conversion_factor": 1}}, dataframe)
+
+
+Robot = {report_code}
+'''
+
+    # 2. Si tiene filas mixtas pero sin código del agente (plantilla estándar):
+    elif has_mixed_rows:
         return f'''"""Migration robot for report {report_code}: {rep_title}."""
 
 import re
@@ -588,6 +670,8 @@ class {report_code}(Migration_Base):
 
 Robot = {report_code}
 '''
+
+    # 3. Reporte homogéneo (métrica y unidad fija):
     else:
         return f'''"""Migration robot for report {report_code}: {rep_title}."""
 
@@ -615,6 +699,10 @@ class {report_code}(Migration_Base):
                     lambda x: str(x).strip() if pd.notna(x) and str(x).strip().lower() not in ["none", "nan", ""] else None
                 )
 
+        idx_valor = dataframe.columns.get_loc("valor")
+        dataframe.insert(idx_valor, column="metrica", value="{metric}")
+        dataframe.insert(idx_valor + 1, column="unidad_metrica", value="{unit}")
+
         dataframe["valor"] = pd.to_numeric(
             dataframe["valor"].astype(str).str.replace(",", ".", regex=False),
             errors="coerce"
@@ -628,8 +716,10 @@ class {report_code}(Migration_Base):
         if factor_val <= 1 and {factor_num} > 1:
             factor_val = {factor_num}
 
-        return ({{"conversion_factor": factor_val}}, dataframe)
+        if factor_val > 1 and "{metric}" == "moneda":
+            dataframe["valor"] = dataframe["valor"] * factor_val
 
+        return ({{"conversion_factor": factor_val}}, dataframe)
 
 
 Robot = {report_code}
