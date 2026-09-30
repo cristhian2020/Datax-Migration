@@ -7,9 +7,10 @@ import shutil
 import sqlite3
 import subprocess
 import importlib.util
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 
 def scan_old_conversion_families(old_repo_path: str) -> List[Dict]:
@@ -244,37 +245,273 @@ def get_sqlite_data(
         return None, sqlite_path, str(exc)
 
 
+def normalize_srch_value(val: str) -> str:
+    """Normaliza un texto para búsqueda en srch_value (sin tildes, caracteres combinados ni mayúsculas)."""
+    if not val:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", str(val))
+    val_clean = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    return re.sub(r"\s+", " ", val_clean).strip().lower()
+
+
+def get_replacement_table_target(
+    report_code: str,
+    db_host: str = "10.0.0.16",
+    db_port: int = 5434,
+    db_user: str = "postgres",
+    db_pass: str = "datax"
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Obtiene schema, table y nombre de la base de datos auxiliar desde platform_db."""
+    try:
+        platform_engine = create_engine(
+            f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/platform_db",
+            connect_args={"connect_timeout": 5}
+        )
+        rep_df = pd.read_sql_query(
+            f"SELECT replacement_table FROM report WHERE code = '{report_code}';",
+            con=platform_engine
+        )
+        if rep_df.empty or not rep_df.iloc[0]["replacement_table"]:
+            return None, None, None, f"No hay 'replacement_table' configurada para {report_code} en platform_db."
+
+        repl_str = str(rep_df.iloc[0]["replacement_table"]).strip()
+        if ";" in repl_str:
+            schema, table = repl_str.split(";", 1)
+        elif "." in repl_str:
+            schema, table = repl_str.split(".", 1)
+        else:
+            return None, None, None, f"Formato inválido en replacement_table: '{repl_str}' (se esperaba 'schema;table')"
+
+        country_code = report_code.split("_")[1] if len(report_code.split("_")) > 1 else "BO"
+        aux_db_name = f"DATA_DB_{country_code}_AUX"
+        return schema.strip(), table.strip(), aux_db_name, None
+    except Exception as exc:
+        return None, None, None, f"Error consultando platform_db: {exc}"
+
+
 def get_replacement_table_data(
     report_code: str,
     db_host: str = "10.0.0.16",
     db_port: int = 5434,
     db_user: str = "postgres",
     db_pass: str = "datax",
-    limit: int = 100
+    limit: Optional[int] = 500
 ) -> Tuple[Optional[pd.DataFrame], str, Optional[str]]:
-    """Consulta la tabla de reemplazos en DATA_DB_BO_AUX."""
-    # 1. Obtener replacement_table desde platform_db
-    try:
-        platform_engine = create_engine(f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/platform_db", connect_args={"connect_timeout": 5})
-        rep_df = pd.read_sql_query(f"SELECT replacement_table FROM report WHERE code = '{report_code}';", con=platform_engine)
-        if rep_df.empty or not rep_df.iloc[0]["replacement_table"]:
-            return None, "", f"No hay 'replacement_table' configurada para {report_code} en platform_db."
+    """Consulta la tabla de reemplazos en DATA_DB_<country>_AUX ordenada de forma determinista."""
+    schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
+    if err or not schema or not table:
+        return None, "", err or "No se pudo determinar la tabla de reemplazos."
 
-        repl_str = rep_df.iloc[0]["replacement_table"]
-        schema, table = repl_str.split(";")
-    except Exception as exc:
-        return None, "", f"Error consultando platform_db: {exc}"
-
-    # 2. Conectar a DATA_DB_<country>_AUX
-    country_code = report_code.split("_")[1] if len(report_code.split("_")) > 1 else "BO"
-    aux_db_name = f"DATA_DB_{country_code}_AUX"
+    tbl_full = f"{schema}.{table}"
     try:
-        aux_engine = create_engine(f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{aux_db_name}", connect_args={"connect_timeout": 5})
-        query = f'SELECT * FROM "{schema}"."{table}" LIMIT {limit};'
-        df = pd.read_sql_query(query, con=aux_engine)
-        return df, f"{schema}.{table}", None
+        aux_engine = create_engine(
+            f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{aux_db_name}",
+            connect_args={"connect_timeout": 5}
+        )
+        limit_clause = f" LIMIT {int(limit)}" if limit else ""
+        try:
+            query = f'SELECT * FROM "{schema}"."{table}" ORDER BY id ASC{limit_clause};'
+            df = pd.read_sql_query(query, con=aux_engine)
+        except Exception:
+            query = f'SELECT * FROM "{schema}"."{table}"{limit_clause};'
+            df = pd.read_sql_query(query, con=aux_engine)
+
+        return df, tbl_full, None
     except Exception as exc:
-        return None, f"{schema}.{table}", str(exc)
+        return None, tbl_full, str(exc)
+
+
+def save_replacement_table_changes(
+    report_code: str,
+    original_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+    db_host: str = "10.0.0.16",
+    db_port: int = 5434,
+    db_user: str = "postgres",
+    db_pass: str = "datax",
+    allow_delete: bool = True
+) -> Dict:
+    """Compara original_df y edited_df y sincroniza atómicamente los cambios (UPDATE, INSERT, DELETE) en la base de datos auxiliar."""
+    schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
+    if err or not schema or not table:
+        return {"success": False, "updated": 0, "inserted": 0, "deleted": 0, "error": err or "No se pudo determinar la tabla."}
+
+    try:
+        aux_engine = create_engine(
+            f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{aux_db_name}",
+            connect_args={"connect_timeout": 8}
+        )
+
+        updates = []
+        inserts = []
+        deletes = []
+
+        has_id = "id" in original_df.columns and "id" in edited_df.columns
+        orig_map = {}
+        if has_id:
+            for _, row in original_df.iterrows():
+                if pd.notnull(row["id"]):
+                    try:
+                        orig_map[int(row["id"])] = row
+                    except (ValueError, TypeError):
+                        pass
+
+        # Identificar updates e inserts
+        for _, row in edited_df.iterrows():
+            rid_raw = row.get("id") if has_id else None
+            is_new = False
+            rid = None
+            if rid_raw is None or pd.isna(rid_raw):
+                is_new = True
+            else:
+                try:
+                    rid = int(rid_raw)
+                    if rid not in orig_map or rid <= 0:
+                        is_new = True
+                except (ValueError, TypeError):
+                    is_new = True
+
+            orig_val = "" if pd.isna(row.get("original_value")) else str(row.get("original_value")).strip()
+            srch_val = "" if pd.isna(row.get("srch_value")) else str(row.get("srch_value")).strip()
+            final_val = "" if pd.isna(row.get("final_value")) else str(row.get("final_value")).strip()
+
+            if is_new:
+                if orig_val or final_val:
+                    if not srch_val and orig_val:
+                        srch_val = normalize_srch_value(orig_val)
+                    inserts.append({
+                        "original_value": orig_val,
+                        "srch_value": srch_val,
+                        "final_value": final_val
+                    })
+            else:
+                orig_row = orig_map[rid]
+                diff = {}
+                for col in ["original_value", "srch_value", "final_value"]:
+                    if col in edited_df.columns and col in original_df.columns:
+                        v_old = "" if pd.isna(orig_row[col]) else str(orig_row[col]).strip()
+                        v_new = "" if pd.isna(row[col]) else str(row[col]).strip()
+                        if v_old != v_new:
+                            diff[col] = v_new
+
+                if diff:
+                    if "original_value" in diff and not diff.get("srch_value") and not srch_val:
+                        diff["srch_value"] = normalize_srch_value(diff["original_value"])
+                    updates.append((rid, diff))
+
+        # Identificar deletes si allow_delete es True
+        if allow_delete and has_id:
+            edited_ids = set()
+            for _, r in edited_df.iterrows():
+                try:
+                    val = r.get("id")
+                    if pd.notnull(val) and not pd.isna(val):
+                        edited_ids.add(int(val))
+                except (ValueError, TypeError):
+                    pass
+            for orig_id in orig_map.keys():
+                if orig_id not in edited_ids:
+                    deletes.append(orig_id)
+
+        if not updates and not inserts and not deletes:
+            return {"success": True, "updated": 0, "inserted": 0, "deleted": 0, "error": None, "message": "No hay cambios pendientes."}
+
+        # Ejecutar en transacción atómica
+        with aux_engine.begin() as conn:
+            # 1. Updates
+            for rid, diff in updates:
+                set_parts = []
+                params = {"_target_id": rid}
+                for k, v in diff.items():
+                    set_parts.append(f'"{k}" = :{k}')
+                    params[k] = v
+                sql_upd = f'UPDATE "{schema}"."{table}" SET {", ".join(set_parts)} WHERE "id" = :_target_id;'
+                conn.execute(text(sql_upd), params)
+
+            # 2. Inserts
+            for ins_data in inserts:
+                sql_ins = f'INSERT INTO "{schema}"."{table}" ("original_value", "srch_value", "final_value", "created_at") VALUES (:original_value, :srch_value, :final_value, NOW());'
+                conn.execute(text(sql_ins), ins_data)
+
+            # 3. Deletes
+            for del_id in deletes:
+                sql_del = f'DELETE FROM "{schema}"."{table}" WHERE "id" = :del_id;'
+                conn.execute(text(sql_del), {"del_id": del_id})
+
+        return {
+            "success": True,
+            "updated": len(updates),
+            "inserted": len(inserts),
+            "deleted": len(deletes),
+            "error": None
+        }
+    except Exception as exc:
+        return {"success": False, "updated": 0, "inserted": 0, "deleted": 0, "error": str(exc)}
+
+
+def insert_single_replacement_record(
+    report_code: str,
+    original_value: str,
+    srch_value: str,
+    final_value: str,
+    db_host: str = "10.0.0.16",
+    db_port: int = 5434,
+    db_user: str = "postgres",
+    db_pass: str = "datax"
+) -> Tuple[bool, Optional[str]]:
+    """Inserta un único registro de reemplazo en la tabla correspondiente."""
+    schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
+    if err or not schema or not table:
+        return False, err or "No se pudo determinar la tabla."
+
+    orig_clean = str(original_value).strip()
+    final_clean = str(final_value).strip()
+    srch_clean = str(srch_value).strip() if srch_value else normalize_srch_value(orig_clean)
+
+    if not orig_clean and not final_clean:
+        return False, "Debes ingresar al menos el valor original o el valor final."
+
+    try:
+        aux_engine = create_engine(
+            f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{aux_db_name}",
+            connect_args={"connect_timeout": 8}
+        )
+        with aux_engine.begin() as conn:
+            conn.execute(
+                text(f'INSERT INTO "{schema}"."{table}" ("original_value", "srch_value", "final_value", "created_at") VALUES (:orig, :srch, :final, NOW());'),
+                {"orig": orig_clean, "srch": srch_clean, "final": final_clean}
+            )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def delete_single_replacement_record(
+    report_code: str,
+    record_id: int,
+    db_host: str = "10.0.0.16",
+    db_port: int = 5434,
+    db_user: str = "postgres",
+    db_pass: str = "datax"
+) -> Tuple[bool, Optional[str]]:
+    """Elimina un único registro de reemplazo por su ID."""
+    schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
+    if err or not schema or not table:
+        return False, err or "No se pudo determinar la tabla."
+
+    try:
+        aux_engine = create_engine(
+            f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{aux_db_name}",
+            connect_args={"connect_timeout": 8}
+        )
+        with aux_engine.begin() as conn:
+            conn.execute(
+                text(f'DELETE FROM "{schema}"."{table}" WHERE "id" = :rid;'),
+                {"rid": int(record_id)}
+            )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 def setup_columns_to_review(sqlite_path: str, report_code: str) -> Tuple[bool, List[str], List[str], Optional[str]]:

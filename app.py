@@ -44,6 +44,10 @@ from core.migrator_conversion import (
     run_conversion_step_test,
     get_sqlite_data,
     get_replacement_table_data,
+    save_replacement_table_changes,
+    insert_single_replacement_record,
+    delete_single_replacement_record,
+    normalize_srch_value,
     setup_columns_to_review,
     apply_conversion_migration,
     get_latest_download_for_report,
@@ -633,26 +637,251 @@ elif "Robots de Conversión" in mode:
                     st.caption(f"Detalle: {err_sq}")
 
         with sub_audit2:
-            st.markdown(f"#### Tabla de Reemplazos en `DATA_DB_BO_AUX`")
-            if st.button("🔄 Cargar / Refrescar Tabla de Reemplazos"):
-                df_repl, repl_tbl_name, err_repl = get_replacement_table_data(
-                    report_code=rep_choice,
-                    db_host=db_host,
-                    db_port=db_port,
-                    db_user=db_user,
-                    db_pass=db_pass,
-                    limit=200
+            st.markdown(f"#### 🏷️ Editor de Tabla de Reemplazos (`DATA_DB_BO_AUX`)")
+            st.caption(
+                "✏️ **Edición Directa en Pantalla:** Puedes editar los valores directamente en la tabla (doble clic en cualquier celda), "
+                "agregar nuevas filas al final o corregir problemas de codificación (ej. 'Espaa' ➔ 'España') sin tener que abrir Beekeeper o DBeaver."
+            )
+
+            # Claves de session_state para persistencia
+            st_key_df = f"repl_data_df_{rep_choice}"
+            st_key_tbl = f"repl_tbl_name_{rep_choice}"
+            st_key_err = f"repl_last_err_{rep_choice}"
+
+            # Botones superiores de acción
+            col_act1, col_act2, col_act3 = st.columns([1.5, 1.5, 3])
+            with col_act1:
+                btn_load = st.button("🔄 Cargar / Refrescar BD", key=f"btn_load_repl_{rep_choice}", help="Recarga los datos frescos de PostgreSQL y descarta ediciones no guardadas")
+            with col_act2:
+                btn_save_top = st.button("💾 Guardar Cambios en BD", key=f"btn_save_repl_top_{rep_choice}", type="primary", help="Aplica todos los cambios (modificaciones, agregados y eliminaciones) en la base de datos")
+
+            # Carga automática inicial o al presionar Refrescar
+            if btn_load or (st_key_df not in st.session_state):
+                with st.spinner("Consultando tabla de reemplazos en PostgreSQL..."):
+                    df_repl, repl_tbl_name, err_repl = get_replacement_table_data(
+                        report_code=rep_choice,
+                        db_host=db_host,
+                        db_port=db_port,
+                        db_user=db_user,
+                        db_pass=db_pass,
+                        limit=500
+                    )
+                    st.session_state[st_key_df] = df_repl
+                    st.session_state[st_key_tbl] = repl_tbl_name
+                    st.session_state[st_key_err] = err_repl
+
+            current_df = st.session_state.get(st_key_df)
+            current_tbl_name = st.session_state.get(st_key_tbl, "")
+            current_err = st.session_state.get(st_key_err)
+
+            if current_df is not None:
+                st.success(f"Tabla activa: **`{current_tbl_name}`** | **{len(current_df)}** registros cargados.")
+
+                # Configuración de columnas para el editor
+                col_cfg = {}
+                if "id" in current_df.columns:
+                    col_cfg["id"] = st.column_config.NumberColumn(
+                        "ID (Solo Lectura)",
+                        disabled=True,
+                        help="Identificador autoincremental de la base de datos (No modificable)"
+                    )
+                if "original_value" in current_df.columns:
+                    col_cfg["original_value"] = st.column_config.TextColumn(
+                        "original_value (Original)",
+                        required=True,
+                        help="Texto original tal como viene en el reporte fuente"
+                    )
+                if "srch_value" in current_df.columns:
+                    col_cfg["srch_value"] = st.column_config.TextColumn(
+                        "srch_value (Búsqueda limpia)",
+                        help="Texto normalizado en minúsculas y sin tildes para búsqueda"
+                    )
+                if "final_value" in current_df.columns:
+                    col_cfg["final_value"] = st.column_config.TextColumn(
+                        "final_value (Reemplazo final)",
+                        required=True,
+                        help="Valor definitivo y estandarizado con el que se mapea"
+                    )
+                if "created_at" in current_df.columns:
+                    col_cfg["created_at"] = st.column_config.DatetimeColumn(
+                        "created_at",
+                        disabled=True,
+                        help="Timestamp de inserción en la base de datos"
+                    )
+
+                # Tabla interactiva
+                edited_df = st.data_editor(
+                    current_df,
+                    key=f"repl_editor_{rep_choice}",
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    column_config=col_cfg
                 )
-                if df_repl is not None:
-                    st.success(f"Tabla `{repl_tbl_name}`: **{len(df_repl)}** registros cargados.")
-                    safe_dataframe(df_repl, use_container_width=True)
-                else:
-                    st.warning(f"No se pudieron cargar datos de la tabla de reemplazos `{repl_tbl_name}`.")
-                    if err_repl:
-                        st.error(f"Error de conexión o consulta: {err_repl}")
-                        st.caption("Si estás fuera de la red del servidor o sin VPN, puedes consultar esta tabla directamente en DBeaver con la VPN activa.")
+
+                # Detección de cambios pendientes
+                n_upd = 0
+                n_ins = 0
+                n_del = 0
+                has_id = "id" in current_df.columns and "id" in edited_df.columns
+                if has_id:
+                    orig_ids = set(current_df["id"].dropna().astype(int).tolist())
+                    edit_ids = set()
+                    for _, r in edited_df.iterrows():
+                        rid = r.get("id")
+                        if pd.notnull(rid) and not pd.isna(rid):
+                            try:
+                                irid = int(rid)
+                                if irid in orig_ids and irid > 0:
+                                    edit_ids.add(irid)
+                                else:
+                                    n_ins += 1
+                            except (ValueError, TypeError):
+                                n_ins += 1
+                        else:
+                            if (pd.notnull(r.get("original_value")) and str(r.get("original_value")).strip()) or (pd.notnull(r.get("final_value")) and str(r.get("final_value")).strip()):
+                                n_ins += 1
+
+                    orig_map = {int(r["id"]): r for _, r in current_df.iterrows() if pd.notnull(r["id"])}
+                    for _, r in edited_df.iterrows():
+                        try:
+                            rid = int(r.get("id"))
+                            if rid in orig_map:
+                                orig_r = orig_map[rid]
+                                for c in ["original_value", "srch_value", "final_value"]:
+                                    if c in edited_df.columns and c in current_df.columns:
+                                        vo = "" if pd.isna(orig_r[c]) else str(orig_r[c]).strip()
+                                        ve = "" if pd.isna(r[c]) else str(r[c]).strip()
+                                        if vo != ve:
+                                            n_upd += 1
+                                            break
+                        except (ValueError, TypeError):
+                            pass
+
+                    n_del = len(orig_ids - edit_ids)
+
+                has_changes = (n_upd > 0 or n_ins > 0 or n_del > 0)
+                if has_changes:
+                    st.info(f"📝 **Cambios locales pendientes:** {n_upd} modificados, {n_ins} nuevos, {n_del} eliminados. Recuerda hacer clic en **Guardar Cambios en BD**.")
+
+                col_s1, col_s2 = st.columns([2, 4])
+                with col_s1:
+                    btn_save_bot = st.button("💾 Guardar Cambios en Base de Datos", key=f"btn_save_repl_bot_{rep_choice}", type="primary", use_container_width=True)
+
+                # Ejecutar guardado si se presiona el botón superior o inferior
+                if btn_save_top or btn_save_bot:
+                    if not has_changes:
+                        st.info("ℹ️ No hay modificaciones pendientes en la tabla.")
+                    else:
+                        with st.spinner("Guardando modificaciones en PostgreSQL (`DATA_DB_BO_AUX`)..."):
+                            res_save = save_replacement_table_changes(
+                                report_code=rep_choice,
+                                original_df=current_df,
+                                edited_df=edited_df,
+                                db_host=db_host,
+                                db_port=db_port,
+                                db_user=db_user,
+                                db_pass=db_pass,
+                                allow_delete=True
+                            )
+                        if res_save.get("success"):
+                            st.success(
+                                f"🎉 **¡Cambios guardados con éxito en `{current_tbl_name}`!** "
+                                f"({res_save['updated']} actualizados, {res_save['inserted']} nuevos, {res_save['deleted']} eliminados)"
+                            )
+                            # Recargar datos actualizados desde la BD
+                            df_repl_fresh, _, _ = get_replacement_table_data(
+                                report_code=rep_choice,
+                                db_host=db_host,
+                                db_port=db_port,
+                                db_user=db_user,
+                                db_pass=db_pass,
+                                limit=500
+                            )
+                            st.session_state[st_key_df] = df_repl_fresh
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Error al guardar en base de datos: {res_save.get('error')}")
+
+                # Sección rápida: Insertar un nuevo reemplazo
+                with st.expander("➕ Formulario Rápido: Agregar un nuevo registro de reemplazo"):
+                    col_nf1, col_nf2, col_nf3 = st.columns(3)
+                    with col_nf1:
+                        new_orig = st.text_input("Texto Original (original_value):", key=f"inp_new_orig_{rep_choice}", placeholder="ej. Bolivia")
+                    with col_nf2:
+                        auto_srch = normalize_srch_value(new_orig) if new_orig else ""
+                        new_srch = st.text_input("Búsqueda Normalizada (srch_value):", value=auto_srch, key=f"inp_new_srch_{rep_choice}", help="Calculado automáticamente sin tildes/espacios")
+                    with col_nf3:
+                        new_final = st.text_input("Valor Final (final_value):", value=new_orig, key=f"inp_new_final_{rep_choice}", placeholder="ej. Bolivia")
+
+                    if st.button("➕ Insertar Registro Directo", key=f"btn_insert_single_{rep_choice}", type="secondary"):
+                        if not new_orig and not new_final:
+                            st.warning("Ingresa un valor original o final.")
+                        else:
+                            ok_ins, err_ins = insert_single_replacement_record(
+                                report_code=rep_choice,
+                                original_value=new_orig,
+                                srch_value=new_srch,
+                                final_value=new_final,
+                                db_host=db_host,
+                                db_port=db_port,
+                                db_user=db_user,
+                                db_pass=db_pass
+                            )
+                            if ok_ins:
+                                st.success(f"✅ Registro insertado exitosamente en `{current_tbl_name}`.")
+                                df_repl_fresh, _, _ = get_replacement_table_data(
+                                    report_code=rep_choice,
+                                    db_host=db_host,
+                                    db_port=db_port,
+                                    db_user=db_user,
+                                    db_pass=db_pass,
+                                    limit=500
+                                )
+                                st.session_state[st_key_df] = df_repl_fresh
+                                st.rerun()
+                            else:
+                                st.error(f"Error al insertar: {err_ins}")
+
+                # Sección de eliminación por ID
+                with st.expander("🗑️ Eliminar un registro específico por ID"):
+                    col_del1, col_del2 = st.columns([2, 1])
+                    with col_del1:
+                        del_id_input = st.number_input("ID del registro a eliminar:", min_value=1, step=1, key=f"inp_del_id_{rep_choice}")
+                    with col_del2:
+                        st.write("")
+                        st.write("")
+                        if st.button("🗑️ Eliminar por ID", key=f"btn_del_single_{rep_choice}"):
+                            ok_del, err_del = delete_single_replacement_record(
+                                report_code=rep_choice,
+                                record_id=del_id_input,
+                                db_host=db_host,
+                                db_port=db_port,
+                                db_user=db_user,
+                                db_pass=db_pass
+                            )
+                            if ok_del:
+                                st.success(f"✅ Registro con ID {del_id_input} eliminado correctamente.")
+                                df_repl_fresh, _, _ = get_replacement_table_data(
+                                    report_code=rep_choice,
+                                    db_host=db_host,
+                                    db_port=db_port,
+                                    db_user=db_user,
+                                    db_pass=db_pass,
+                                    limit=500
+                                )
+                                st.session_state[st_key_df] = df_repl_fresh
+                                st.rerun()
+                            else:
+                                st.error(f"Error al eliminar: {err_del}")
+
             else:
-                st.info("Presiona el botón para consultar la tabla de reemplazos de este reporte en `DATA_DB_BO_AUX`.")
+                st.warning(f"No se pudieron cargar datos de la tabla de reemplazos `{current_tbl_name or rep_choice}`.")
+                if current_err:
+                    st.error(f"Detalle: {current_err}")
+                st.info("Asegúrate de que la conexión a `platform_db` y `DATA_DB_BO_AUX` esté activa (VPN o red local) y que hayas ejecutado la prueba con reemplazos en el Paso 2.")
+                if st.button("🔄 Reintentar Carga", key=f"btn_retry_load_{rep_choice}"):
+                    st.session_state.pop(st_key_df, None)
+                    st.rerun()
 
     # ─────────────────────────────────────────────────────────────
     # PASO 4: PLANTILLA SQLITE (COLUMNS_TO_REVIEW)
