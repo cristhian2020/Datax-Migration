@@ -11,6 +11,7 @@ import unicodedata
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from sqlalchemy import create_engine, text
+from core.config import DEFAULT_DB_HOST, DEFAULT_DB_PORT, DEFAULT_DB_USER, DEFAULT_DB_PASS
 
 
 def scan_old_conversion_families(old_repo_path: str) -> List[Dict]:
@@ -342,10 +343,10 @@ def normalize_srch_value(val: str) -> str:
 
 def get_replacement_table_target(
     report_code: str,
-    db_host: str = "10.0.0.16",
-    db_port: int = 5434,
-    db_user: str = "postgres",
-    db_pass: str = "datax"
+    db_host: str = DEFAULT_DB_HOST,
+    db_port: int = DEFAULT_DB_PORT,
+    db_user: str = DEFAULT_DB_USER,
+    db_pass: str = DEFAULT_DB_PASS
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Obtiene schema, table y nombre de la base de datos auxiliar desde platform_db."""
     try:
@@ -377,10 +378,10 @@ def get_replacement_table_target(
 
 def get_replacement_table_data(
     report_code: str,
-    db_host: str = "10.0.0.16",
-    db_port: int = 5434,
-    db_user: str = "postgres",
-    db_pass: str = "datax",
+    db_host: str = DEFAULT_DB_HOST,
+    db_port: int = DEFAULT_DB_PORT,
+    db_user: str = DEFAULT_DB_USER,
+    db_pass: str = DEFAULT_DB_PASS,
     limit: Optional[int] = 500
 ) -> Tuple[Optional[pd.DataFrame], str, Optional[str]]:
     """Consulta la tabla de reemplazos en DATA_DB_<country>_AUX ordenada de forma determinista."""
@@ -411,10 +412,10 @@ def save_replacement_table_changes(
     report_code: str,
     original_df: pd.DataFrame,
     edited_df: pd.DataFrame,
-    db_host: str = "10.0.0.16",
-    db_port: int = 5434,
-    db_user: str = "postgres",
-    db_pass: str = "datax",
+    db_host: str = DEFAULT_DB_HOST,
+    db_port: int = DEFAULT_DB_PORT,
+    db_user: str = DEFAULT_DB_USER,
+    db_pass: str = DEFAULT_DB_PASS,
     allow_delete: bool = True
 ) -> Dict:
     """Compara original_df y edited_df y sincroniza atómicamente los cambios (UPDATE, INSERT, DELETE) en la base de datos auxiliar."""
@@ -540,10 +541,10 @@ def insert_single_replacement_record(
     original_value: str,
     srch_value: str,
     final_value: str,
-    db_host: str = "10.0.0.16",
-    db_port: int = 5434,
-    db_user: str = "postgres",
-    db_pass: str = "datax"
+    db_host: str = DEFAULT_DB_HOST,
+    db_port: int = DEFAULT_DB_PORT,
+    db_user: str = DEFAULT_DB_USER,
+    db_pass: str = DEFAULT_DB_PASS
 ) -> Tuple[bool, Optional[str]]:
     """Inserta un único registro de reemplazo en la tabla correspondiente."""
     schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
@@ -575,10 +576,10 @@ def insert_single_replacement_record(
 def delete_single_replacement_record(
     report_code: str,
     record_id: int,
-    db_host: str = "10.0.0.16",
-    db_port: int = 5434,
-    db_user: str = "postgres",
-    db_pass: str = "datax"
+    db_host: str = DEFAULT_DB_HOST,
+    db_port: int = DEFAULT_DB_PORT,
+    db_user: str = DEFAULT_DB_USER,
+    db_pass: str = DEFAULT_DB_PASS
 ) -> Tuple[bool, Optional[str]]:
     """Elimina un único registro de reemplazo por su ID."""
     schema, table, aux_db_name, err = get_replacement_table_target(report_code, db_host, db_port, db_user, db_pass)
@@ -781,3 +782,50 @@ def reset_report_migrated_to_in_db(report_code: str, engine) -> Dict:
             return {"success": True, "message": f"Campo 'migrated_to' de {report_code} reseteado a NULL exitosamente."}
     except Exception as exc:
         return {"success": False, "message": f"Error al actualizar BD: {exc}"}
+
+
+def scan_v2_conversion_families(new_repo_path: str) -> List[Dict]:
+    """Escanea las carpetas de familias de conversión existentes directamente en el repositorio V2."""
+    conv_dir = os.path.join(new_repo_path, "models", "conversion")
+    if not os.path.isdir(conv_dir):
+        return []
+
+    families = []
+    for item in sorted(os.listdir(conv_dir)):
+        item_path = os.path.join(conv_dir, item)
+        if not os.path.isdir(item_path):
+            continue
+
+        match = re.search(r"(C_[A-Z]{2}_\d{9})", item)
+        if not match:
+            continue
+
+        parent_code = match.group(1)
+        sub_reports = []
+        samples = []
+        sqlites = []
+
+        for f in os.listdir(item_path):
+            fpath = os.path.join(item_path, f)
+            if not os.path.isfile(fpath):
+                continue
+            lower = f.lower()
+            if lower.endswith(".py") and not lower.startswith("__"):
+                rep_match = re.search(r"(D_[A-Z]{2}_\d{9}_\d{2})", f)
+                rep_code = rep_match.group(1) if rep_match else os.path.splitext(f)[0]
+                sub_reports.append({"code": rep_code, "file": fpath})
+            elif lower.endswith((".pdf", ".xlsx", ".xls", ".csv")):
+                samples.append(fpath)
+            elif lower.endswith(".sqlite"):
+                sqlites.append(fpath)
+
+        families.append({
+            "parent_code": parent_code,
+            "folder": item_path,
+            "sub_reports": sub_reports,
+            "samples": samples,
+            "sqlites": sqlites
+        })
+
+    return families
+

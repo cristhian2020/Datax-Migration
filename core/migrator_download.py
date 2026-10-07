@@ -387,3 +387,114 @@ def apply_download_migration(code: str, source_file: str, new_repo_path: str, do
         "can_force_dag": (dest_file is not None and os.path.isfile(dest_file)),
         "file_saved": dest_file
     }
+
+
+def scan_v2_download_robots(new_repo_path: str) -> List[Dict]:
+    """Escanea los robots de descarga ya existentes o nuevos en el repositorio V2."""
+    download_dir = os.path.join(new_repo_path, "models", "download")
+    if not os.path.isdir(download_dir):
+        return []
+
+    robots = []
+    for item in sorted(os.listdir(download_dir)):
+        item_path = os.path.join(download_dir, item)
+        if not os.path.isdir(item_path):
+            continue
+
+        match = re.search(r"(D_[A-Z]{2}_\d{9})", item)
+        if not match:
+            continue
+
+        code = match.group(1)
+        script_file = os.path.join(item_path, f"{code}.py")
+        has_script = os.path.isfile(script_file)
+        if not has_script:
+            for f in os.listdir(item_path):
+                if f.endswith(".py") and not f.startswith("__"):
+                    script_file = os.path.join(item_path, f)
+                    has_script = True
+                    break
+
+        dag_file = os.path.join(new_repo_path, "dags", "download", f"{code}.py")
+        has_dag = os.path.isfile(dag_file)
+
+        robots.append({
+            "code": code,
+            "folder": item_path,
+            "script_file": script_file if has_script else None,
+            "has_script": has_script,
+            "has_dag": has_dag,
+            "dag_file": dag_file if has_dag else None
+        })
+
+    return robots
+
+
+def save_v2_download_code(code: str, new_repo_path: str, code_content: str) -> Tuple[bool, str]:
+    """Guarda directamente el código V2 de un robot de descarga sin aplicar refactorización de V1."""
+    dest_dir = os.path.join(new_repo_path, "models", "download", code)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    init_path = os.path.join(dest_dir, "__init__.py")
+    if os.path.exists(init_path):
+        try:
+            os.remove(init_path)
+        except Exception:
+            pass
+
+    dest_file = os.path.join(dest_dir, f"{code}.py")
+    with open(dest_file, "w", encoding="utf-8") as f:
+        f.write(code_content)
+    return True, dest_file
+
+
+def test_download_robot_v2(code: str, new_repo_path: str, download_type: str = "", test_updated_to: str = "2024-01-01") -> Dict:
+    """Ejecuta la prueba unitaria directamente sobre un robot que ya está en models/download/."""
+    logs = []
+    diagnostics = []
+    success = True
+
+    type_map = [
+        (r"\bTipo\s+IV\b|file_download_type_iv|multi_file_download_template", "test_download_type_iv.py"),
+        (r"\bTipo\s+III\b|file_download_type_iii|data_download_template", "test_download_type_iii.py"),
+        (r"\bTipo\s+II\b|file_download_type_ii|direct_download_template", "test_download_type_ii.py"),
+        (r"\bTipo\s+I\b|file_download_type_i|file_download_template", "test_download_type_i.py"),
+    ]
+    test_file = None
+    for pattern, t_file in type_map:
+        if re.search(pattern, str(download_type), re.IGNORECASE):
+            test_file = t_file
+            break
+
+    if not test_file:
+        test_file = "test_download_type_i.py"
+        logs.append(f"ℹ️ Tipo de descarga no explícito ('{download_type}'). Usando plantilla de prueba estándar: {test_file}")
+
+    test_path = os.path.join(new_repo_path, "models", "download", "tests", test_file)
+    logs.append(f"🧪 Ejecutando test unitario: {test_file} con fecha {test_updated_to}...")
+
+    env = os.environ.copy()
+    env["CODE_ROBOT"] = code
+    env["UPDATED_TO"] = test_updated_to
+
+    try:
+        res = subprocess.run([sys.executable, "-m", "unittest", test_path], cwd=new_repo_path, env=env, capture_output=True, text=True)
+        test_output = res.stderr or res.stdout
+        if res.returncode == 0:
+            logs.append("🎉 Test unitario APROBADO (OK)")
+        else:
+            logs.append(f"⚠️ Test unitario FALLÓ:\n{test_output}")
+            success = False
+            diagnostics = diagnose_download_test_failure(test_output, test_updated_to, code)
+            for d in diagnostics:
+                logs.append(f"💡 {d}")
+    except Exception as exc:
+        logs.append(f"❌ Error al ejecutar test: {exc}")
+        success = False
+
+    return {
+        "success": success,
+        "logs": logs,
+        "diagnostics": diagnostics
+    }
+

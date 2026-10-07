@@ -26,6 +26,10 @@ from core.config import (
     DEFAULT_DB_USER,
     DEFAULT_DB_PASS,
     DEFAULT_DB_NAME,
+    DEFAULT_SSH_HOST,
+    DEFAULT_SSH_PORT,
+    DEFAULT_SSH_USER,
+    DEFAULT_SSH_PASS,
     DEFAULT_GITHUB_REPO,
     DEFAULT_GITHUB_TOKEN,
     get_engine,
@@ -38,6 +42,9 @@ from core.github_client import (
 )
 from core.migrator_download import (
     scan_old_download_robots,
+    scan_v2_download_robots,
+    save_v2_download_code,
+    test_download_robot_v2,
     get_download_db_info,
     refactor_download_code,
     apply_download_migration,
@@ -46,6 +53,7 @@ from core.migrator_download import (
 )
 from core.migrator_conversion import (
     scan_old_conversion_families,
+    scan_v2_conversion_families,
     get_conversion_db_info,
     refactor_conversion_code,
     detect_available_samples,
@@ -64,6 +72,8 @@ from core.migrator_conversion import (
 )
 from core.migrator_migration import (
     scan_conversion_outputs,
+    scan_existing_migration_robots,
+    load_migration_robot_files,
     get_migration_db_info,
     inspect_sqlite_structure,
     generate_migration_sql,
@@ -105,6 +115,38 @@ def safe_dataframe(df: pd.DataFrame, use_container_width: bool = True, **kwargs)
         </div>
         """
         st.markdown(styled_html, unsafe_allow_html=True)
+
+
+def show_deploy_success_banner(robot_code: str, process_type: str = "Robot", dag_id: str = ""):
+    """Muestra una notificación Toast flotante y un Banner DevOps profesional de confirmación."""
+    actual_dag = dag_id or robot_code
+    try:
+        st.toast(f"✅ {process_type} {robot_code} desplegado y DAG activo en Airflow!", icon="🚀")
+    except Exception:
+        pass
+
+    styled_banner = f"""
+    <div style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.12), rgba(6, 78, 59, 0.25)); border: 1px solid #10b981; border-left: 5px solid #10b981; border-radius: 8px; padding: 14px 18px; margin: 14px 0 18px 0; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <span style="font-size: 1.5rem;">🟢</span>
+                <div>
+                    <div style="color: #34d399; font-weight: 700; font-size: 1.02rem; letter-spacing: 0.5px;">
+                        DESPLIEGUE EXITOSO EN SERVIDOR DEV
+                    </div>
+                    <div style="color: #cbd5e1; font-size: 0.88rem; margin-top: 2px;">
+                        Archivos sincronizados por SFTP y DAG <code>{actual_dag}</code> registrado en el worker de Airflow.
+                    </div>
+                </div>
+            </div>
+            <div style="background: rgba(16, 185, 129, 0.2); border: 1px solid #10b981; padding: 4px 10px; border-radius: 6px; font-size: 0.78rem; color: #6ee7b7; font-family: monospace;">
+                STATUS: DEPLOYED & READY
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(styled_banner, unsafe_allow_html=True)
+
 
 
 # ─── SIDEBAR ───────────────────────────────────────────────────
@@ -188,169 +230,537 @@ with st.sidebar.expander("🤖 Agente IA (Google Gemini)", expanded=False):
     st.session_state["gemini_api_key"] = gemini_api_key
     st.caption("ℹ️ *Si no se ingresa clave, el Agente usará el Motor Heurístico Avanzado de forma 100% offline.*")
 
-mode = st.sidebar.radio("Navegación", ["📥 Robots de Descarga", "🔄 Robots de Conversión", "🚚 Robots de Migración", "📦 Migración por Lote", "🚀 Despliegue al Servidor"])
+mode = st.sidebar.radio("Navegación", [
+    "📥 Robots de Descarga", 
+    "🔄 Robots de Conversión", 
+    "🚚 Robots de Migración",
+    # "📦 Migración por Lote"  # 
+])
 
 # ─── PESTAÑA 1: DESCARGA ───────────────────────────────────────
 if "Robots de Descarga" in mode:
-    st.header("📥 Migración de Robots de Descarga (`D_...`)")
-    st.caption("Estandarización automática a V2 (Download_Base, Tipo I-IV, Playwright y creación de DAGs).")
+    st.header("📥 Robots de Descarga (`D_...`)")
+    st.caption("Estandarización V1 ➔ V2 o Validación, Pruebas y Despliegue de robots nuevos desarrollados en V2.")
 
-    robots = scan_old_download_robots(old_repo)
-    if not robots:
-        st.warning(f"No se encontraron robots de descarga en `{old_repo}/models/download`.")
+    dl_flow_mode = st.radio(
+        "Flujo de trabajo para Descarga:",
+        ["🔄 Migrar desde Repositorio V1 (Legado)", "✨ Código Nuevo / Ya Desarrollado en V2"],
+        horizontal=True,
+        key="dl_flow_mode"
+    )
+
+    if dl_flow_mode.startswith("🔄"):
+        robots = scan_old_download_robots(old_repo)
+        if not robots:
+            st.warning(f"No se encontraron robots de descarga en `{old_repo}/models/download`.")
+        else:
+            robot_codes = [r["code"] for r in robots]
+            selected_code = st.selectbox("Selecciona el robot a migrar:", robot_codes, index=0)
+            selected_robot = next(r for r in robots if r["code"] == selected_code)
+
+            # Estado en BD y en V2
+            new_robot_path = os.path.join(new_repo, "models", "download", selected_code, f"{selected_code}.py")
+            new_dag_path = os.path.join(new_repo, "dags", "download", f"{selected_code}.py")
+            already_migrated = os.path.isfile(new_robot_path)
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Código Robot", selected_code)
+            col2.metric("Estado en Repo V2", "🟢 Migrado" if already_migrated else "🔴 Pendiente")
+
+            db_info = get_download_db_info(selected_code, engine) if db_connected else None
+            if db_info and "error" not in db_info:
+                col3.metric("Tipo Descarga", db_info.get("download_type", "No definido"))
+                col4.metric("Última Descarga", str(db_info.get("updated_to", "-")))
+                st.info(f"🏛️ **{db_info.get('name')}** | URL: {db_info.get('main_url')} | Frecuencia: `{db_info.get('schedule_interval')}`")
+            else:
+                col3.metric("Tipo Descarga", "Desconocido")
+                col4.metric("Última Descarga", "-")
+
+            # Lectura y Refactor
+            raw_code = ""
+            refactored_code = ""
+            if selected_robot["script_file"] and os.path.isfile(selected_robot["script_file"]):
+                with open(selected_robot["script_file"], "r", encoding="utf-8", errors="ignore") as f:
+                    raw_code = f.read()
+                dl_type = db_info.get("download_type", "") if db_info else ""
+                refactored_code = refactor_download_code(raw_code, selected_code, dl_type)
+
+            tab_code, tab_action, tab_deploy = st.tabs(["📄 Comparativa de Código (V1 vs V2)", "⚡ Ejecutar Migración", "🚀 Despliegue al Servidor"])
+
+            with tab_code:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.subheader("Código Original (V1)")
+                    st.code(raw_code, language="python")
+                with c2:
+                    st.subheader("Código Estandarizado (V2)")
+                    st.code(refactored_code, language="python")
+
+            # Gestión de BD para el robot de descarga
+            if db_connected:
+                with st.expander(f"🛠️ Gestión de Base de Datos para `{selected_code}`", expanded=False):
+                    c_db1, c_db2 = st.columns([3, 1])
+                    with c_db1:
+                        new_db_dt = st.text_input("Nueva fecha 'updated_to' (o 'NULL' para resetear)", value="2024-01-01", key=f"db_dt_{selected_code}")
+                    with c_db2:
+                        st.write("")
+                        st.write("")
+                        if st.button("💾 Actualizar en BD", key=f"btn_upd_db_{selected_code}", use_container_width=True):
+                            upd_res = reset_file_updated_to_in_db(selected_code, new_db_dt, engine)
+                            if upd_res["success"]:
+                                st.success(upd_res["message"])
+                                st.rerun()
+                            else:
+                                st.error(upd_res["message"])
+
+            with tab_action:
+                st.subheader("Opciones de Migración")
+                c_opt1, c_opt2 = st.columns(2)
+                with c_opt1:
+                    skip_test = st.checkbox("Omitir test unitario (migrar solo archivos y DAG)", value=False)
+                with c_opt2:
+                    generate_dag = st.checkbox("Generar DAG de Airflow en dags/download", value=True, help="Genera automáticamente el DAG en dags/download/<CODE>.py")
+                skip_dag = not generate_dag
+
+                # Selector inteligente de fechas de corte
+                st.markdown("**📅 Fecha de corte para la prueba (`UPDATED_TO`):**")
+                st.caption("ℹ️ El test exige encontrar al menos un archivo posterior a esta fecha. Selecciona una fecha anterior a la última publicación para asegurar que el scraper pase.")
+                
+                db_date_val = str(db_info.get("updated_to", "")) if db_info and db_info.get("updated_to") else "2024-01-01"
+                
+                c_dt1, c_dt2, c_dt3 = st.columns(3)
+                with c_dt1:
+                    if st.button("⏪ 1 año antes (Recomendado)", key=f"dt_1y_{selected_code}", use_container_width=True):
+                        st.session_state[f"test_date_{selected_code}"] = "2024-01-01"
+                        st.rerun()
+                with c_dt2:
+                    if st.button("📜 Histórico (2020-01-01)", key=f"dt_hist_{selected_code}", use_container_width=True):
+                        st.session_state[f"test_date_{selected_code}"] = "2020-01-01"
+                        st.rerun()
+                with c_dt3:
+                    if st.button("📅 Fecha en BD", key=f"dt_db_{selected_code}", use_container_width=True):
+                        st.session_state[f"test_date_{selected_code}"] = db_date_val
+                        st.rerun()
+
+                current_test_date = st.session_state.get(f"test_date_{selected_code}", "2024-01-01")
+                test_date = st.text_input("Fecha seleccionada para la prueba:", value=current_test_date, key=f"input_dt_{selected_code}")
+
+                col_btn1, col_btn2 = st.columns(2)
+                if col_btn1.button("🧪 Simulación (Dry-Run)", use_container_width=True):
+                    st.info(f"Simulación exitosa: {selected_code} listo para migrarse a `{new_robot_path}`.")
+
+                if col_btn2.button("🚀 Migrar Robot y Ejecutar Prueba", type="primary", use_container_width=True):
+                    with st.spinner("Procesando migración, ejecutando pruebas y creando DAG..."):
+                        res = apply_download_migration(
+                            code=selected_code,
+                            source_file=selected_robot["script_file"],
+                            new_repo_path=new_repo,
+                            download_type=db_info.get("download_type", "") if db_info else "",
+                            skip_test=skip_test,
+                            skip_dag=skip_dag,
+                            test_updated_to=test_date
+                        )
+                        st.session_state[f"last_dl_res_{selected_code}"] = res
+                        if res["success"]:
+                            st.success(f"✨ ¡Robot {selected_code} migrado exitosamente a la Plataforma V2!")
+                        else:
+                            st.error(f"⚠️ Ocurrieron advertencias o fallos durante la migración.")
+
+                # Mostrar resultados guardados en session_state para permitir rescate
+                last_res = st.session_state.get(f"last_dl_res_{selected_code}")
+                if last_res:
+                    if last_res.get("diagnostics"):
+                        st.markdown("### 🩺 Diagnóstico Inteligente de Fallos")
+                        for d in last_res["diagnostics"]:
+                            st.warning(d)
+
+                    if not last_res["success"] and last_res.get("can_force_dag"):
+                        st.markdown("---")
+                        st.info("💡 El archivo `.py` ya fue guardado en `models/download`. Si el fallo se debe a que el portal web no tiene archivos nuevos hoy o requieres desplegarlo, puedes generar el DAG directamente:")
+                        if st.button("🚀 Forzar Generación de DAG (Omitir fallo de fecha)", key=f"force_dag_{selected_code}", type="secondary", use_container_width=True):
+                            with st.spinner("Generando DAG en dags/download..."):
+                                f_res = generate_download_dag_only(selected_code, new_repo)
+                                if f_res["success"]:
+                                    st.success(f_res["message"])
+                                else:
+                                    st.error(f_res["message"])
+
+                    with st.expander("📋 Ver logs completos de la migración", expanded=not last_res["success"]):
+                        for l in last_res["logs"]:
+                            st.write(l)
+
+            with tab_deploy:
+                st.subheader(f"Despliegue al Servidor Remoto para `{selected_code}`")
+                st.caption(f"Sube `{selected_code}` al servidor y ejecuta el generador de DAGs en Docker.")
+                col_sd1, col_sd2 = st.columns(2)
+                with col_sd1:
+                    dep_v1_host = st.text_input("Host Servidor:", value=DEFAULT_SSH_HOST, key=f"dep_v1_dl_host_{selected_code}")
+                    dep_v1_user = st.text_input("Usuario SSH:", value=DEFAULT_SSH_USER, key=f"dep_v1_dl_user_{selected_code}")
+                with col_sd2:
+                    dep_v1_port = st.number_input("Puerto SSH:", value=DEFAULT_SSH_PORT, key=f"dep_v1_dl_port_{selected_code}")
+                    dep_v1_pass = st.text_input("Contraseña SSH:", value=DEFAULT_SSH_PASS, type="password", key=f"dep_v1_dl_pass_{selected_code}")
+
+                col_con1, col_con2 = st.columns([1, 3])
+                with col_con1:
+                    if st.button("🔌 Probar Conexión", key=f"btn_test_ssh_v1_{selected_code}"):
+                        if not dep_v1_pass:
+                            st.warning("Ingresa la contraseña de SSH.")
+                        else:
+                            ok_c, msg_c = test_connection(dep_v1_host, int(dep_v1_port), dep_v1_user, dep_v1_pass)
+                            if ok_c: st.success(msg_c)
+                            else: st.error(msg_c)
+
+                gen_dag_srv_v1 = st.checkbox("Generar DAG de descarga en Docker (Airflow)", value=True, key=f"chk_v1_dag_srv_{selected_code}")
+
+                if st.button("🚀 Subir al Servidor y Desplegar Robot", type="primary", use_container_width=True, key=f"btn_v1_dep_srv_{selected_code}"):
+                    if not dep_v1_pass:
+                        st.error("Introduce la contraseña de SSH.")
+                    elif not already_migrated:
+                        st.error(f"El robot aún no ha sido migrado a `{new_robot_path}`. Ejecuta primero la migración en la pestaña anterior.")
+                    else:
+                        with st.spinner("Transfiriendo archivos vía SFTP y ejecutando generador en Docker..."):
+                            local_dl_folder = os.path.join(new_repo, "models", "download", selected_code)
+                            res_dep = deploy_robot_to_server(
+                                host=dep_v1_host,
+                                port=int(dep_v1_port),
+                                username=dep_v1_user,
+                                password=dep_v1_pass,
+                                remote_base_path="/home/datax-pds/datax/data-processing-platform-dev",
+                                process_type="download",
+                                robot_code=selected_code,
+                                local_dir=local_dl_folder,
+                                generate_dag=gen_dag_srv_v1
+                            )
+                            if res_dep["success"]:
+                                show_deploy_success_banner(selected_code, process_type="Robot de Descarga")
+                            else:
+                                st.error("⚠️ Ocurrieron errores durante el despliegue.")
+                            for l in res_dep["logs"]:
+                                st.write(l)
+
+                st.markdown("---")
+                st.markdown("#### ⚡ Disparar DAG en Airflow (Trigger Remoto)")
+                if st.button(f"🎯 Disparar DAG `{selected_code}` en Airflow", key=f"btn_v1_trig_dl_{selected_code}"):
+                    if not dep_v1_pass:
+                        st.error("Introduce la contraseña de SSH.")
+                    else:
+                        with st.spinner(f"Disparando DAG {selected_code} en Airflow..."):
+                            trig_res = trigger_dag_on_server(
+                                host=dep_v1_host,
+                                port=int(dep_v1_port),
+                                username=dep_v1_user,
+                                password=dep_v1_pass,
+                                remote_base_path="/home/datax-pds/datax/data-processing-platform-dev",
+                                dag_id=selected_code,
+                                conf={}
+                            )
+                            if trig_res["success"]:
+                                st.success(f"🎉 DAG `{selected_code}` disparado exitosamente en Airflow!")
+                            else:
+                                st.warning("El comando terminó con advertencias o error.")
+                            with st.expander("Ver salida detallada de Airflow", expanded=True):
+                                st.code(trig_res["output"] or "Sin salida")
+
     else:
-        robot_codes = [r["code"] for r in robots]
-        selected_code = st.selectbox("Selecciona el robot a migrar:", robot_codes, index=0)
-        selected_robot = next(r for r in robots if r["code"] == selected_code)
+        # ─── FLUJO CÓDIGO NUEVO / YA EN V2 ───────────────────────────
+        v2_dl_robots = scan_v2_download_robots(new_repo)
+        
+        sel_v2_mode = st.radio(
+            "Modo de selección de robot V2:",
+            ["📁 Seleccionar de robots en Repo V2 (models/download)", "✍️ Ingresar código manualmente (GitHub / Nuevo)"],
+            horizontal=True,
+            key="sel_v2_dl_mode"
+        )
 
-        # Estado en BD y en V2
+        if sel_v2_mode.startswith("📁") and v2_dl_robots:
+            v2_codes = [r["code"] for r in v2_dl_robots]
+            selected_code = st.selectbox("Robot de Descarga detectado en V2:", v2_codes, index=0, key="sel_code_v2_dl")
+            current_robot_data = next((r for r in v2_dl_robots if r["code"] == selected_code), None)
+        else:
+            if sel_v2_mode.startswith("📁") and not v2_dl_robots:
+                st.info("No se encontraron carpetas de robots en `models/download` del repositorio V2 aún. Puedes ingresar el código a continuación:")
+            selected_code = st.text_input("Código del robot de descarga (ej. D_BO_000000017):", value="D_BO_000000017", key="inp_code_v2_dl").strip()
+            current_robot_data = next((r for r in v2_dl_robots if r["code"] == selected_code), None)
+
+        # Estado en Repo V2 y en BD
         new_robot_path = os.path.join(new_repo, "models", "download", selected_code, f"{selected_code}.py")
         new_dag_path = os.path.join(new_repo, "dags", "download", f"{selected_code}.py")
-        already_migrated = os.path.isfile(new_robot_path)
+        script_exists = os.path.isfile(new_robot_path)
+        dag_exists = os.path.isfile(new_dag_path)
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Código Robot", selected_code)
-        col2.metric("Estado en Repo V2", "🟢 Migrado" if already_migrated else "🔴 Pendiente")
+        col2.metric("Script V2", "🟢 Presente" if script_exists else "🔴 Pendiente")
+        col3.metric("DAG Airflow", "🟢 Creado" if dag_exists else "🔴 Pendiente")
 
         db_info = get_download_db_info(selected_code, engine) if db_connected else None
         if db_info and "error" not in db_info:
-            col3.metric("Tipo Descarga", db_info.get("download_type", "No definido"))
             col4.metric("Última Descarga", str(db_info.get("updated_to", "-")))
-            st.info(f"🏛️ **{db_info.get('name')}** | URL: {db_info.get('main_url')} | Frecuencia: `{db_info.get('schedule_interval')}`")
+            st.info(f"🏛️ **{db_info.get('name')}** | Tipo: `{db_info.get('download_type', 'No definido')}` | URL: {db_info.get('main_url')} | Frecuencia: `{db_info.get('schedule_interval')}`")
         else:
-            col3.metric("Tipo Descarga", "Desconocido")
             col4.metric("Última Descarga", "-")
+            st.caption("ℹ️ Sin registro activo en la tabla `file` de `platform_db` (Offline o robot nuevo).")
 
-        # Lectura y Refactor
-        raw_code = ""
-        refactored_code = ""
-        if selected_robot["script_file"] and os.path.isfile(selected_robot["script_file"]):
-            with open(selected_robot["script_file"], "r", encoding="utf-8", errors="ignore") as f:
-                raw_code = f.read()
-            dl_type = db_info.get("download_type", "") if db_info else ""
-            refactored_code = refactor_download_code(raw_code, selected_code, dl_type)
+        tab_v2_code, tab_v2_test, tab_v2_deploy = st.tabs([
+            "💻 1. Código del Robot (V2)",
+            "🧪 2. Pruebas Unitarias & DAG",
+            "🚀 3. Despliegue al Servidor"
+        ])
 
-        tab_code, tab_action = st.tabs(["📄 Comparativa de Código (V1 vs V2)", "⚡ Ejecutar Migración"])
+        with tab_v2_code:
+            st.subheader(f"Gestión de Código V2 para `{selected_code}`")
+            src_options = [
+                "📁 Archivo local en Repo V2 (models/download)",
+                "🐙 Cargar desde Pull Request de GitHub (Pasantes)",
+                "📤 Subir archivo .py (descargado)",
+                "📋 Pegar código del desarrollador directamente"
+            ]
+            chosen_src = st.radio("Origen del código:", src_options, index=0 if script_exists else 3, horizontal=True, key=f"src_v2_{selected_code}")
 
-        with tab_code:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.subheader("Código Original (V1)")
-                st.code(raw_code, language="python")
-            with c2:
-                st.subheader("Código Estandarizado (V2)")
-                st.code(refactored_code, language="python")
+            raw_code_v2 = ""
+            if chosen_src.startswith("📁"):
+                if script_exists:
+                    with open(new_robot_path, "r", encoding="utf-8", errors="ignore") as f:
+                        raw_code_v2 = f.read()
+                else:
+                    raw_code_v2 = f"# No existe aún el archivo: models/download/{selected_code}/{selected_code}.py"
 
-        # Gestión de BD para el robot de descarga
-        if db_connected:
-            with st.expander(f"🛠️ Gestión de Base de Datos para `{selected_code}`", expanded=False):
-                c_db1, c_db2 = st.columns([3, 1])
-                with c_db1:
-                    new_db_dt = st.text_input("Nueva fecha 'updated_to' (o 'NULL' para resetear)", value="2024-01-01", key=f"db_dt_{selected_code}")
-                with c_db2:
-                    st.write("")
-                    st.write("")
-                    if st.button("💾 Actualizar en BD", key=f"btn_upd_db_{selected_code}", use_container_width=True):
-                        upd_res = reset_file_updated_to_in_db(selected_code, new_db_dt, engine)
-                        if upd_res["success"]:
-                            st.success(upd_res["message"])
-                            st.rerun()
-                        else:
-                            st.error(upd_res["message"])
+            elif chosen_src.startswith("🐙"):
+                active_gh_token = st.session_state.get("github_token", DEFAULT_GITHUB_TOKEN)
+                active_gh_repo = st.session_state.get("github_repo", DEFAULT_GITHUB_REPO)
+                if not active_gh_token:
+                    st.warning("Configura tu GitHub PAT en la barra lateral para consultar PRs.")
+                else:
+                    pr_q = st.text_input("Filtrar PRs por código:", value=selected_code, key=f"pr_q_dl_{selected_code}")
+                    with st.spinner("Consultando GitHub..."):
+                        prs_found = list_pull_requests(active_gh_token, active_gh_repo, state="open", search_query=pr_q)
+                    if prs_found:
+                        pr_labels = [f"PR #{p['number']}: {p['title']} (@{p['author']})" for p in prs_found]
+                        sel_pr_idx = st.selectbox("Selecciona PR:", range(len(pr_labels)), format_func=lambda i: pr_labels[i], key=f"sel_pr_dl_{selected_code}")
+                        chosen_pr = prs_found[sel_pr_idx]
+                        pr_files = get_pr_files(active_gh_token, active_gh_repo, chosen_pr["number"])
+                        py_files = [f for f in pr_files if f["is_py"]]
+                        if py_files:
+                            py_sel_name = st.selectbox("Archivo en PR:", [f["filename"] for f in py_files], key=f"py_pr_dl_{selected_code}")
+                            chosen_py = next(f for f in py_files if f["filename"] == py_sel_name)
+                            if st.button("📥 Cargar al Editor", key=f"btn_load_pr_dl_{selected_code}"):
+                                dl_bytes = download_github_file(active_gh_token, chosen_py["raw_url"], chosen_py["contents_url"])
+                                if dl_bytes:
+                                    raw_code_v2 = dl_bytes.decode("utf-8", errors="ignore")
+                                    st.session_state[f"gh_code_dl_{selected_code}"] = raw_code_v2
+                                    st.success("Código descargado del PR.")
+                            if f"gh_code_dl_{selected_code}" in st.session_state:
+                                raw_code_v2 = st.session_state[f"gh_code_dl_{selected_code}"]
 
-        with tab_action:
-            st.subheader("Opciones de Migración")
-            c_opt1, c_opt2 = st.columns(2)
-            with c_opt1:
-                skip_test = st.checkbox("Omitir test unitario (migrar solo archivos y DAG)", value=False)
-            with c_opt2:
-                generate_dag = st.checkbox("Generar DAG de Airflow en dags/download", value=True, help="Genera automáticamente el DAG en dags/download/<CODE>.py")
-            skip_dag = not generate_dag
+            elif chosen_src.startswith("📤"):
+                uploaded_py = st.file_uploader("Subir script .py:", type=["py"], key=f"up_py_dl_{selected_code}")
+                if uploaded_py:
+                    raw_code_v2 = uploaded_py.getvalue().decode("utf-8", errors="ignore")
+                    st.success("Archivo subido con éxito.")
 
-            # Selector inteligente de fechas de corte
-            st.markdown("**📅 Fecha de corte para la prueba (`UPDATED_TO`):**")
-            st.caption("ℹ️ El test exige encontrar al menos un archivo posterior a esta fecha. Selecciona una fecha anterior a la última publicación para asegurar que el scraper pase.")
-            
-            db_date_val = str(db_info.get("updated_to", "")) if db_info and db_info.get("updated_to") else "2024-01-01"
-            
-            c_dt1, c_dt2, c_dt3 = st.columns(3)
-            with c_dt1:
-                if st.button("⏪ 1 año antes (Recomendado)", key=f"dt_1y_{selected_code}", use_container_width=True):
-                    st.session_state[f"test_date_{selected_code}"] = "2024-01-01"
-                    st.rerun()
-            with c_dt2:
-                if st.button("📜 Histórico (2020-01-01)", key=f"dt_hist_{selected_code}", use_container_width=True):
-                    st.session_state[f"test_date_{selected_code}"] = "2020-01-01"
-                    st.rerun()
-            with c_dt3:
-                if st.button("📅 Fecha en BD", key=f"dt_db_{selected_code}", use_container_width=True):
-                    st.session_state[f"test_date_{selected_code}"] = db_date_val
-                    st.rerun()
+            elif chosen_src.startswith("📋"):
+                init_val = ""
+                if script_exists:
+                    with open(new_robot_path, "r", encoding="utf-8", errors="ignore") as f:
+                        init_val = f.read()
+                raw_code_v2 = st.text_area("Pega el código Python desarrollado en V2:", value=init_val, height=280, key=f"ta_code_dl_{selected_code}")
 
-            current_test_date = st.session_state.get(f"test_date_{selected_code}", "2024-01-01")
-            test_date = st.text_input("Fecha seleccionada para la prueba:", value=current_test_date, key=f"input_dt_{selected_code}")
+            st.markdown("**Visualizador / Editor de Código V2:**")
+            st.code(raw_code_v2 if raw_code_v2 else "# Esperando código...", language="python")
 
-            col_btn1, col_btn2 = st.columns(2)
-            if col_btn1.button("🧪 Simulación (Dry-Run)", use_container_width=True):
-                st.info(f"Simulación exitosa: {selected_code} listo para migrarse a `{new_robot_path}`.")
-
-            if col_btn2.button("🚀 Migrar Robot y Ejecutar Prueba", type="primary", use_container_width=True):
-                with st.spinner("Procesando migración, ejecutando pruebas y creando DAG..."):
-                    res = apply_download_migration(
-                        code=selected_code,
-                        source_file=selected_robot["script_file"],
-                        new_repo_path=new_repo,
-                        download_type=db_info.get("download_type", "") if db_info else "",
-                        skip_test=skip_test,
-                        skip_dag=skip_dag,
-                        test_updated_to=test_date
-                    )
-                    st.session_state[f"last_dl_res_{selected_code}"] = res
-                    if res["success"]:
-                        st.success(f"✨ ¡Robot {selected_code} migrado exitosamente a la Plataforma V2!")
+            c_sv1, c_sv2 = st.columns([2, 1])
+            with c_sv1:
+                chk_ensure_compat = st.checkbox("Asegurar alias de compatibilidad (`Executor_<CODE> = <CODE>`, `Robot = <CODE>`)", value=True, key=f"chk_compat_dl_{selected_code}")
+            with c_sv2:
+                if st.button("💾 Guardar en models/download/ (V2)", type="primary", use_container_width=True, key=f"btn_save_v2_dl_{selected_code}"):
+                    if not raw_code_v2.strip() or raw_code_v2.startswith("# No existe aún"):
+                        st.error("No hay código válido para guardar.")
                     else:
-                        st.error(f"⚠️ Ocurrieron advertencias o fallos durante la migración.")
+                        final_to_save = raw_code_v2
+                        if chk_ensure_compat and f"Executor_{selected_code}" not in final_to_save:
+                            final_to_save = final_to_save.rstrip() + f"\n\nExecutor_{selected_code} = {selected_code}\nRobot = {selected_code}\n"
+                        ok_sv, sv_path = save_v2_download_code(selected_code, new_repo, final_to_save)
+                        if ok_sv:
+                            st.success(f"✨ Guardado exitosamente en: `{sv_path}`")
+                            st.rerun()
 
-            # Mostrar resultados guardados en session_state para permitir rescate
-            last_res = st.session_state.get(f"last_dl_res_{selected_code}")
-            if last_res:
-                if last_res.get("diagnostics"):
-                    st.markdown("### 🩺 Diagnóstico Inteligente de Fallos")
-                    for d in last_res["diagnostics"]:
-                        st.warning(d)
+        with tab_v2_test:
+            st.subheader("Pruebas Unitarias & Generación de DAG")
+            st.caption("Ejecuta el test unitario de scraping sobre el archivo local ya presente en `models/download/`.")
 
-                if not last_res["success"] and last_res.get("can_force_dag"):
-                    st.markdown("---")
-                    st.info("💡 El archivo `.py` ya fue guardado en `models/download`. Si el fallo se debe a que el portal web no tiene archivos nuevos hoy o requieres desplegarlo, puedes generar el DAG directamente:")
-                    if st.button("🚀 Forzar Generación de DAG (Omitir fallo de fecha)", key=f"force_dag_{selected_code}", type="secondary", use_container_width=True):
-                        with st.spinner("Generando DAG en dags/download..."):
-                            f_res = generate_download_dag_only(selected_code, new_repo)
-                            if f_res["success"]:
-                                st.success(f_res["message"])
+            if not script_exists:
+                st.warning(f"⚠️ El archivo `{new_robot_path}` no existe aún. Guárdalo primero en la pestaña 1.")
+            else:
+                db_date_val = str(db_info.get("updated_to", "")) if db_info and db_info.get("updated_to") else "2024-01-01"
+                st.markdown("**📅 Fecha de corte para la prueba (`UPDATED_TO`):**")
+                c_dt1, c_dt2, c_dt3 = st.columns(3)
+                with c_dt1:
+                    if st.button("⏪ 1 año antes (Recomendado)", key=f"v2_dt_1y_{selected_code}", use_container_width=True):
+                        st.session_state[f"v2_test_date_{selected_code}"] = "2024-01-01"
+                        st.rerun()
+                with c_dt2:
+                    if st.button("📜 Histórico (2020-01-01)", key=f"v2_dt_hist_{selected_code}", use_container_width=True):
+                        st.session_state[f"v2_test_date_{selected_code}"] = "2020-01-01"
+                        st.rerun()
+                with c_dt3:
+                    if st.button("📅 Fecha en BD", key=f"v2_dt_db_{selected_code}", use_container_width=True):
+                        st.session_state[f"v2_test_date_{selected_code}"] = db_date_val
+                        st.rerun()
+
+                cur_v2_dt = st.session_state.get(f"v2_test_date_{selected_code}", "2024-01-01")
+                test_date_v2 = st.text_input("Fecha seleccionada:", value=cur_v2_dt, key=f"v2_inp_dt_{selected_code}")
+
+                col_tbtn1, col_tbtn2 = st.columns(2)
+                with col_tbtn1:
+                    if st.button("🧪 Ejecutar Prueba Unitaria en V2", type="primary", use_container_width=True, key=f"btn_test_v2_dl_{selected_code}"):
+                        dl_type_str = db_info.get("download_type", "") if db_info else ""
+                        with st.spinner(f"Ejecutando prueba unitaria de {selected_code} con fecha {test_date_v2}..."):
+                            t_res = test_download_robot_v2(selected_code, new_repo, dl_type_str, test_date_v2)
+                            st.session_state[f"last_v2_test_{selected_code}"] = t_res
+                            if t_res["success"]:
+                                st.success(f"🎉 ¡Prueba unitaria APROBADA (OK) para `{selected_code}`!")
                             else:
-                                st.error(f_res["message"])
+                                st.error("⚠️ La prueba unitaria falló.")
 
-                with st.expander("📋 Ver logs completos de la migración", expanded=not last_res["success"]):
-                    for l in last_res["logs"]:
-                        st.write(l)
+                with col_tbtn2:
+                    if st.button("🚀 Generar DAG de Descarga en Airflow", use_container_width=True, key=f"btn_dag_v2_dl_{selected_code}"):
+                        with st.spinner("Generando DAG en dags/download..."):
+                            dag_res = generate_download_dag_only(selected_code, new_repo)
+                            if dag_res["success"]:
+                                st.success(dag_res["message"])
+                                st.rerun()
+                            else:
+                                st.error(dag_res["message"])
+
+                last_t = st.session_state.get(f"last_v2_test_{selected_code}")
+                if last_t:
+                    if last_t.get("diagnostics"):
+                        st.markdown("### 🩺 Diagnóstico Inteligente de Fallos")
+                        for d in last_t["diagnostics"]:
+                            st.warning(d)
+                    with st.expander("📋 Ver logs completos de la prueba", expanded=not last_t["success"]):
+                        for l in last_t["logs"]:
+                            st.write(l)
+
+            # Gestión de BD
+            if db_connected:
+                with st.expander(f"🛠️ Gestión de Base de Datos para `{selected_code}`", expanded=False):
+                    c_db1, c_db2 = st.columns([3, 1])
+                    with c_db1:
+                        new_db_dt_v2 = st.text_input("Nueva fecha 'updated_to' (o 'NULL' para resetear)", value="2024-01-01", key=f"v2_db_dt_{selected_code}")
+                    with c_db2:
+                        st.write("")
+                        st.write("")
+                        if st.button("💾 Actualizar en BD", key=f"v2_btn_upd_db_{selected_code}", use_container_width=True):
+                            upd_res = reset_file_updated_to_in_db(selected_code, new_db_dt_v2, engine)
+                            if upd_res["success"]:
+                                st.success(upd_res["message"])
+                                st.rerun()
+                            else:
+                                st.error(upd_res["message"])
+
+        with tab_v2_deploy:
+            st.subheader(f"Despliegue al Servidor Remoto para `{selected_code}`")
+            col_sd1, col_sd2 = st.columns(2)
+            with col_sd1:
+                dep_dl_host = st.text_input("Host Servidor:", value=DEFAULT_SSH_HOST, key=f"dep_dl_host_{selected_code}")
+                dep_dl_user = st.text_input("Usuario SSH:", value=DEFAULT_SSH_USER, key=f"dep_dl_user_{selected_code}")
+            with col_sd2:
+                dep_dl_port = st.number_input("Puerto SSH:", value=DEFAULT_SSH_PORT, key=f"dep_dl_port_{selected_code}")
+                dep_dl_pass = st.text_input("Contraseña SSH:", value=DEFAULT_SSH_PASS, type="password", key=f"dep_dl_pass_{selected_code}")
+
+            col_con_v2_1, col_con_v2_2 = st.columns([1, 3])
+            with col_con_v2_1:
+                if st.button("🔌 Probar Conexión", key=f"btn_test_ssh_v2_{selected_code}"):
+                    if not dep_dl_pass:
+                        st.warning("Ingresa la contraseña de SSH.")
+                    else:
+                        ok_c, msg_c = test_connection(dep_dl_host, int(dep_dl_port), dep_dl_user, dep_dl_pass)
+                        if ok_c: st.success(msg_c)
+                        else: st.error(msg_c)
+
+            gen_dag_srv = st.checkbox("Generar DAG de descarga en Docker (Airflow)", value=True, key=f"chk_gen_dag_srv_{selected_code}")
+
+            if st.button("🚀 Subir al Servidor y Desplegar Robot de Descarga", type="primary", use_container_width=True, key=f"btn_dep_srv_dl_{selected_code}"):
+                if not dep_dl_pass:
+                    st.error("Introduce la contraseña de SSH.")
+                elif not script_exists:
+                    st.error(f"No existe el archivo `{new_robot_path}` para transferir.")
+                else:
+                    with st.spinner("Transfiriendo archivos vía SFTP y ejecutando generador en Docker..."):
+                        local_dl_folder = os.path.join(new_repo, "models", "download", selected_code)
+                        res_dep = deploy_robot_to_server(
+                            host=dep_dl_host,
+                            port=int(dep_dl_port),
+                            username=dep_dl_user,
+                            password=dep_dl_pass,
+                            remote_base_path="/home/datax-pds/datax/data-processing-platform-dev",
+                            process_type="download",
+                            robot_code=selected_code,
+                            local_dir=local_dl_folder,
+                            generate_dag=gen_dag_srv
+                        )
+                        if res_dep["success"]:
+                            show_deploy_success_banner(selected_code, process_type="Robot de Descarga")
+                        else:
+                            st.error("⚠️ Ocurrieron errores durante el despliegue.")
+                        for l in res_dep["logs"]:
+                            st.write(l)
+
+            st.markdown("---")
+            st.markdown("#### ⚡ Disparar DAG en Airflow (Trigger Remoto)")
+            if st.button(f"🎯 Disparar DAG `{selected_code}` en Airflow", key=f"btn_v2_trig_dl_{selected_code}"):
+                if not dep_dl_pass:
+                    st.error("Introduce la contraseña de SSH.")
+                else:
+                    with st.spinner(f"Disparando DAG {selected_code} en Airflow..."):
+                        trig_res = trigger_dag_on_server(
+                            host=dep_dl_host,
+                            port=int(dep_dl_port),
+                            username=dep_dl_user,
+                            password=dep_dl_pass,
+                            remote_base_path="/home/datax-pds/datax/data-processing-platform-dev",
+                            dag_id=selected_code,
+                            conf={}
+                        )
+                        if trig_res["success"]:
+                            st.success(f"🎉 DAG `{selected_code}` disparado exitosamente en Airflow!")
+                        else:
+                            st.warning("El comando terminó con advertencias o error.")
+                        with st.expander("Ver salida detallada de Airflow", expanded=True):
+                            st.code(trig_res["output"] or "Sin salida")
 
 # ─── PESTAÑA 2: CONVERSIÓN (ASISTENTE POR PASOS) ───────────────
 elif "Robots de Conversión" in mode:
-    st.header("🔄 Asistente por Pasos: Migración de Conversión (`C_...`)")
+    st.header("🔄 Asistente por Pasos: Robots de Conversión (`C_...`)")
     st.caption("Flujo guiado y seguro de 5 pasos para extraer, auditar datos (NVx/fecha/valor), configurar plantilla y desplegar al servidor.")
 
-    # Selección de Modo: Ingresar código directo (GitHub/Jira) o Explorar repositorio escaneado
-    sel_mode = st.radio(
-        "Modo de selección de reporte:",
-        ["✍️ Ingresar código del reporte manualmente (GitHub / Jira)", "📁 Seleccionar de repositorio local escaneado"],
+    conv_flow_mode = st.radio(
+        "Flujo de trabajo para Conversión:",
+        ["🔄 Migrar desde Repositorio V1 (Legado)", "✨ Código Nuevo / Ya Desarrollado en V2"],
         horizontal=True,
-        key="conv_sel_mode"
+        key="conv_flow_mode"
     )
 
-    families = scan_old_conversion_families(old_repo)
+    is_v2_flow = conv_flow_mode.startswith("✨")
+    if is_v2_flow:
+        families = scan_v2_conversion_families(new_repo)
+        scan_option_label = "📁 Seleccionar de repositorio nuevo V2 (models/conversion)"
+    else:
+        families = scan_old_conversion_families(old_repo)
+        scan_option_label = "📁 Seleccionar de repositorio antiguo V1 escaneado"
+
+    # Selección de Modo: Ingresar código directo (GitHub/Jira/Nuevo) o Explorar repositorio escaneado
+    sel_mode = st.radio(
+        "Modo de selección de reporte:",
+        ["✍️ Ingresar código del reporte manualmente (GitHub / Jira / Nuevo)", scan_option_label],
+        horizontal=True,
+        key=f"conv_sel_mode_{'v2' if is_v2_flow else 'v1'}"
+    )
+
     selected_fam = {"parent_code": "", "folder": "", "sub_reports": [], "samples": [], "sqlites": []}
 
-    if sel_mode == "✍️ Ingresar código del reporte manualmente (GitHub / Jira)":
+    if sel_mode.startswith("✍️"):
         col_m1, col_m2 = st.columns([1, 1])
         with col_m1:
             rep_input = st.text_input("Código del reporte (ej. D_BO_000000017_01):", value="D_BO_000000017_01").strip()
@@ -379,14 +789,14 @@ elif "Robots de Conversión" in mode:
 
     else:
         if not families:
-            st.warning(f"No se encontraron familias de conversión en `{old_repo}/models/conversion`.")
+            repo_label = "repositorio nuevo V2" if is_v2_flow else "repositorio antiguo V1"
+            st.warning(f"No se encontraron familias de conversión en el {repo_label}.")
             selected_parent = "C_BO_000000017"
             rep_choice = "D_BO_000000017_01"
         else:
             fam_codes = [f["parent_code"] for f in families]
             col_fam1, col_fam2 = st.columns([1, 1])
             with col_fam1:
-                # Si C_BO_000000017 está en la lista, preseleccionarlo; si no, index 0
                 def_idx = fam_codes.index("C_BO_000000017") if "C_BO_000000017" in fam_codes else 0
                 selected_parent = st.selectbox("1. Selecciona la familia de conversión:", fam_codes, index=def_idx)
                 selected_fam = next(f for f in families if f["parent_code"] == selected_parent)
@@ -601,18 +1011,34 @@ elif "Robots de Conversión" in mode:
                 key=f"text_area_{rep_choice}"
             )
 
-        refactored_conv_code = refactor_conversion_code(raw_conv_code, rep_choice)
+        is_already_v2 = ("Conversion_Base" in raw_conv_code and "models.conversion" in raw_conv_code) or is_v2_flow
+        
+        apply_conv_refactor = st.checkbox(
+            "Aplicar refactorizador V1 ➔ V2 (quitar sys.path, ajustar imports y clase base Conversion_Base)",
+            value=(not is_already_v2),
+            key=f"chk_apply_conv_refactor_{rep_choice}",
+            help="Desmárcalo si el código ya fue escrito o adaptado directamente en la arquitectura V2."
+        )
 
-        c_code1, c_code2 = st.columns(2)
-        with c_code1:
-            st.markdown("**Código Original / Ingresado**")
-            st.code(raw_conv_code if raw_conv_code else "# Sin código ingresado", language="python")
-        with c_code2:
-            st.markdown("**Código Estandarizado (V2)**")
-            st.code(refactored_conv_code if refactored_conv_code else "# Esperando código", language="python")
+        if apply_conv_refactor:
+            refactored_conv_code = refactor_conversion_code(raw_conv_code, rep_choice)
+            c_code1, c_code2 = st.columns(2)
+            with c_code1:
+                st.markdown("**Código Original / Ingresado**")
+                st.code(raw_conv_code if raw_conv_code else "# Sin código ingresado", language="python")
+            with c_code2:
+                st.markdown("**Código Estandarizado (V2)**")
+                st.code(refactored_conv_code if refactored_conv_code else "# Esperando código", language="python")
+            code_to_save = refactored_conv_code
+            save_btn_label = f"💾 Guardar Código Estandarizado de {rep_choice} en V2"
+        else:
+            st.markdown("**Código V2 Listo para Guardar / Ejecutar:**")
+            st.code(raw_conv_code if raw_conv_code else "# Esperando código...", language="python")
+            code_to_save = raw_conv_code
+            save_btn_label = f"💾 Guardar Código de {rep_choice} en V2"
 
-        if st.button(f"💾 Guardar Código Estandarizado de {rep_choice} en V2", type="primary"):
-            if not raw_conv_code.strip() or raw_conv_code.startswith("# No se encontró"):
+        if st.button(save_btn_label, type="primary", key=f"btn_save_conv_code_{rep_choice}"):
+            if not code_to_save.strip() or code_to_save.startswith("# No se encontró"):
                 st.error("No hay código válido para guardar. Carga o pega el código primero.")
             else:
                 dest_parent_dir = os.path.join(new_repo, "models", "conversion", selected_parent)
@@ -626,8 +1052,8 @@ elif "Robots de Conversión" in mode:
                     
                 target_script = os.path.join(dest_parent_dir, f"{rep_choice}.py")
                 with open(target_script, "w", encoding="utf-8") as f:
-                    f.write(refactored_conv_code)
-                st.success(f"✨ Archivo guardado correctamente en: `{target_script}` (sin `__init__.py`)")
+                    f.write(code_to_save)
+                st.success(f"✨ Archivo guardado correctamente en: `{target_script}`")
 
     # ─────────────────────────────────────────────────────────────
     # PASO 2: PRUEBAS DE CONVERSIÓN (FASE 1 Y 2)
@@ -1011,18 +1437,18 @@ elif "Robots de Conversión" in mode:
         st.subheader("Paso 5: Despliegue al Servidor Remoto y Generación de DAG")
         st.markdown("""
         Una vez que los datos y la plantilla SQLite han sido verificados:
-        1. Sube el script `.py` a `models/conversion/` en el servidor (sin `__init__.py`).
+        1. Sube el script `.py` a `models/conversion/` en el servidor.
         2. Sube la plantilla `.sqlite` de referencia a `/mnt/datos1/data_process/...`.
         3. Genera el DAG de conversión automáticamente en Airflow (Docker).
         """)
 
         col_dep1, col_dep2 = st.columns(2)
         with col_dep1:
-            deploy_srv_host = st.text_input("Host Servidor:", value=db_host, key="dep_conv_host")
-            deploy_srv_user = st.text_input("Usuario SSH:", value="datax-pds", key="dep_conv_user")
+            deploy_srv_host = st.text_input("Host Servidor:", value=DEFAULT_SSH_HOST, key="dep_conv_host")
+            deploy_srv_user = st.text_input("Usuario SSH:", value=DEFAULT_SSH_USER, key="dep_conv_user")
         with col_dep2:
-            deploy_srv_port = st.number_input("Puerto SSH:", value=22, key="dep_conv_port")
-            deploy_srv_pass = st.text_input("Contraseña SSH / sudo:", type="password", key="dep_conv_pass")
+            deploy_srv_port = st.number_input("Puerto SSH:", value=DEFAULT_SSH_PORT, key="dep_conv_port")
+            deploy_srv_pass = st.text_input("Contraseña SSH / sudo:", value=DEFAULT_SSH_PASS, type="password", key="dep_conv_pass")
 
         dest_sq_check = os.path.join(new_repo, "models", "conversion", selected_parent, f"{rep_choice}.sqlite")
         sq_available = os.path.isfile(dest_sq_check)
@@ -1050,9 +1476,7 @@ elif "Robots de Conversión" in mode:
                         generate_dag=gen_dag_choice
                     )
                     if res_dep["success"]:
-                        st.success(f"✨ ¡Despliegue completado con éxito para {selected_parent} ({rep_choice})!")
-                        if res_dep.get("dag_generated"):
-                            st.balloons()
+                        show_deploy_success_banner(selected_parent, process_type="Robot de Conversión", dag_id=selected_parent)
                     else:
                         st.error("⚠️ Ocurrieron errores durante el despliegue.")
 
@@ -1116,17 +1540,25 @@ elif "Robots de Conversión" in mode:
 # PESTAÑA: MIGRACIÓN A POSTGRESQL (M_...)
 # ═════════════════════════════════════════════════════════════════════════════
 elif "Robots de Migración" in mode:
-    st.header("🚚 Generador y Despliegue de Migración (`M_...` / PostgreSQL)")
-    st.caption("Lee el `.sqlite` generado en Conversión, genera el DDL `.sql` y el robot Python `.py` estandarizado, y despliega automáticamente.")
+    st.header("🚚 Robots de Migración (`M_...` / PostgreSQL)")
+    st.caption("Generación automática desde SQLite de Conversión o Revisión y Despliegue de robots de migración existentes en V2.")
 
-    conv_families = scan_conversion_outputs(new_repo)
-    if not conv_families:
-        st.warning(f"No se encontraron familias de conversión con archivos `.sqlite` en `{new_repo}/models/conversion`.")
-    else:
-        fam_dict = {f["parent_code"]: f for f in conv_families}
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            sel_parent = st.selectbox("1. Familia de Conversión / Migración:", list(fam_dict.keys()), key="mig_parent_sel")
+    mig_flow_mode = st.radio(
+        "Flujo de trabajo para Migración:",
+        ["🔄 Generar desde SQLite de Conversión (Flujo Estándar)", "✨ Robot de Migración Existente / Ya Desarrollado en V2"],
+        horizontal=True,
+        key="mig_flow_mode"
+    )
+
+    if mig_flow_mode.startswith("🔄"):
+        conv_families = scan_conversion_outputs(new_repo)
+        if not conv_families:
+            st.warning(f"No se encontraron familias de conversión con archivos `.sqlite` en `{new_repo}/models/conversion`.")
+        else:
+            fam_dict = {f["parent_code"]: f for f in conv_families}
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                sel_parent = st.selectbox("1. Familia de Conversión / Migración:", list(fam_dict.keys()), key="mig_parent_sel")
         
         fam_info = fam_dict[sel_parent]
         reports_in_fam = fam_info["reports"]
@@ -1401,7 +1833,7 @@ elif "Robots de Migración" in mode:
             with col_d2:
                 st.markdown("#### 🚀 Despliegue Rápido por SSH")
                 st.caption(f"Sube `{mig_parent_code}` al servidor, asigna permisos y ejecuta `main-generate.py` opción 3.")
-                mig_ssh_pass = st.text_input("Contraseña SSH (datax-pds):", type="password", key="mig_ssh_pass")
+                mig_ssh_pass = st.text_input("Contraseña SSH (datax-pds):", value=DEFAULT_SSH_PASS, type="password", key="mig_ssh_pass")
                 
                 if st.button(f"🚀 Desplegar {mig_parent_code} y Generar DAG en Servidor", use_container_width=True):
                     if not mig_ssh_pass:
@@ -1412,9 +1844,9 @@ elif "Robots de Migración" in mode:
                         
                         with st.spinner("Desplegando en el servidor..."):
                             deploy_res = deploy_robot_to_server(
-                                host="10.0.0.16",
-                                port=22,
-                                username="datax-pds",
+                                host=DEFAULT_SSH_HOST,
+                                port=DEFAULT_SSH_PORT,
+                                username=DEFAULT_SSH_USER,
                                 password=mig_ssh_pass,
                                 process_type="migration",
                                 robot_code=mig_parent_code,
@@ -1422,7 +1854,7 @@ elif "Robots de Migración" in mode:
                                 generate_dag=True
                             )
                         if deploy_res["success"]:
-                            st.success(f"¡Despliegue y DAG generado exitosamente para `{mig_parent_code}`!")
+                            show_deploy_success_banner(mig_parent_code, process_type="Robot de Migración", dag_id=mig_parent_code)
                         else:
                             st.error(f"Error en despliegue: {deploy_res['error']}")
                         with st.expander("Ver logs de despliegue"):
@@ -1466,9 +1898,9 @@ elif "Robots de Migración" in mode:
                         corte_str = f" con corte {latest_conv['converted_to']}" if latest_conv else ""
                         with st.spinner(f"Disparando DAG {mig_parent_code} en Airflow worker{corte_str}..."):
                             trig_res = trigger_dag_on_server(
-                                host="10.0.0.16",
-                                port=22,
-                                username="datax-pds",
+                                host=DEFAULT_SSH_HOST,
+                                port=DEFAULT_SSH_PORT,
+                                username=DEFAULT_SSH_USER,
                                 password=mig_ssh_pass,
                                 dag_id=mig_parent_code,
                                 conf=conf_payload
@@ -1480,145 +1912,203 @@ elif "Robots de Migración" in mode:
                         with st.expander("Ver logs de disparo de Airflow", expanded=True):
                             st.code(trig_res["output"] or "Sin salida de terminal.")
 
-elif "Migración por Lote" in mode:
-    st.header("📊 Migración Masiva por Lote (Batch)")
-    st.caption("Migra múltiples robots de descarga o conversión de una sola vez.")
-
-    batch_type = st.radio("Tipo de proceso a migrar en lote:", ["Descarga", "Conversión"], horizontal=True)
-
-    if batch_type == "Descarga":
-        dl_robots = scan_old_download_robots(old_repo)
-        st.write(f"Total robots encontrados en repo antiguo: **{len(dl_robots)}**")
-
-        if st.button("🚀 Iniciar Migración por Lote de Descarga", type="primary"):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            results = []
-
-            for i, r in enumerate(dl_robots):
-                code = r["code"]
-                status_text.write(f"Procesando {i+1}/{len(dl_robots)}: {code}...")
-                if r["script_file"]:
-                    res = apply_download_migration(
-                        code=code,
-                        source_file=r["script_file"],
-                        new_repo_path=new_repo,
-                        skip_test=True, # Lote rápido
-                        skip_dag=True
-                    )
-                    results.append({"Código": code, "Estado": "🟢 OK" if res["success"] else "⚠️ Revisión"})
-                progress_bar.progress((i + 1) / len(dl_robots))
-
-            status_text.success("¡Proceso por lote completado!")
-            safe_dataframe(pd.DataFrame(results), use_container_width=True)
-
-
-# ─── PESTAÑA 4: DESPLIEGUE AL SERVIDOR ────────────────────────
-elif "Despliegue al Servidor" in mode:
-    st.header("☁️ Despliegue Automatizado al Servidor Remoto (10.0.0.16)")
-    st.caption("Transfiere los robots migrados desde tu máquina al servidor y ejecuta el generador de DAGs en Docker.")
-
-    col_ssh1, col_ssh2 = st.columns(2)
-    with col_ssh1:
-        st.subheader("🔑 Credenciales del Servidor")
-        ssh_host = st.text_input("IP / Host del Servidor", value="10.0.0.16")
-        ssh_port = st.number_input("Puerto SSH", value=22, step=1)
-        ssh_user = st.text_input("Usuario SSH", value="datax-pds")
-        ssh_pass = st.text_input("Contraseña (SSH y sudo)", type="password", help="Necesaria para conectar por SSH y ejecutar sudo si la carpeta remota lo requiere.")
-
-    with col_ssh2:
-        st.subheader("📁 Rutas y Verificación")
-        ssh_remote_path = st.text_input("Ruta remota de la plataforma", value="/home/datax-pds/datax/data-processing-platform-dev")
-        
-        st.write("")
-        st.write("")
-        if st.button("🔌 Probar Conexión SSH", use_container_width=True):
-            if not ssh_pass:
-                st.warning("⚠️ Ingresa la contraseña de datax-pds para probar la conexión.")
-            else:
-                with st.spinner("Conectando al servidor..."):
-                    ok_conn, msg_conn = test_connection(
-                        host=ssh_host,
-                        port=int(ssh_port),
-                        username=ssh_user,
-                        password=ssh_pass
-                    )
-                if ok_conn:
-                    st.success(f"✅ {msg_conn}")
-                else:
-                    st.error(f"❌ {msg_conn}")
-
-    st.markdown("---")
-    st.subheader("📦 Seleccionar Robot Migrado para Subir")
-
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        deploy_proc = st.radio("Tipo de Proceso:", ["Descarga (download)", "Conversión (conversion)", "Migración (migration)"], horizontal=True)
-        if "Descarga" in deploy_proc:
-            proc_key = "download"
-        elif "Conversión" in deploy_proc:
-            proc_key = "conversion"
-        else:
-            proc_key = "migration"
-
-    migrated_list = list_migrated_robots(new_repo, proc_key)
-
-    if not migrated_list:
-        st.warning(f"No se encontraron robots migrados en `{new_repo}/models/{proc_key}`.")
     else:
-        robot_options = [r["code"] for r in migrated_list]
-        selected_deploy_code = st.selectbox(
-            "Selecciona el robot a desplegar:",
-            robot_options,
-            index=0
+        # ─── FLUJO ROBOT DE MIGRACIÓN EXISTENTE / YA EN V2 ────────────
+        existing_migs = scan_existing_migration_robots(new_repo)
+        
+        sel_v2_mig_mode = st.radio(
+            "Modo de selección de robot de migración:",
+            ["📁 Seleccionar de robots en models/migration", "✍️ Ingresar código manualmente (Nuevo / GitHub)"],
+            horizontal=True,
+            key="sel_v2_mig_mode"
         )
-        selected_deploy_robot = next(r for r in migrated_list if r["code"] == selected_deploy_code)
 
-        with col_p2:
+        if sel_v2_mig_mode.startswith("📁") and existing_migs:
+            fam_dict_v2 = {f["parent_code"]: f for f in existing_migs}
+            col_vm1, col_vm2 = st.columns(2)
+            with col_vm1:
+                mig_parent_code = st.selectbox("1. Familia de Migración (M_...):", list(fam_dict_v2.keys()), key="v2_mig_parent_sel")
+            fam_v2_info = fam_dict_v2[mig_parent_code]
+            rep_v2_codes = [r["code"] for r in fam_v2_info["reports"]]
+            with col_vm2:
+                sel_report = st.selectbox("2. Reporte de Migración:", rep_v2_codes, key="v2_mig_rep_sel")
+        else:
+            if sel_v2_mig_mode.startswith("📁") and not existing_migs:
+                st.info("No se encontraron carpetas `M_...` en `models/migration/` aún. Puedes ingresar los códigos manualmente:")
+            col_vm1, col_vm2 = st.columns(2)
+            with col_vm1:
+                mig_parent_code = st.text_input("Familia de migración (ej. M_BO_000000017):", value="M_BO_000000017", key="v2_mig_inp_parent").strip()
+            with col_vm2:
+                sel_report = st.text_input("Reporte de migración (ej. D_BO_000000017_01):", value="D_BO_000000017_01", key="v2_mig_inp_rep").strip()
+
+        # Cargar archivos existentes si existen
+        loaded_mig = load_migration_robot_files(new_repo, mig_parent_code, sel_report)
+        py_content_v2 = loaded_mig["py_content"]
+        sql_content_v2 = loaded_mig["sql_content"]
+
+        has_py = bool(py_content_v2.strip())
+        has_sql = bool(sql_content_v2.strip())
+
+        db_mig_info = get_migration_db_info(sel_report, engine) if (db_connected and engine is not None) else None
+        if db_mig_info:
             st.info(
-                f"**Robot:** `{selected_deploy_code}`\n\n"
-                f"**Carpeta local:** `{selected_deploy_robot['folder_path']}`\n\n"
-                f"**Archivos a transferir ({selected_deploy_robot['files_count']}):** {', '.join(selected_deploy_robot['files'])}"
+                f"📊 **Metadatos en BD:** Nombre: *{db_mig_info.get('name', 'N/A')}* | "
+                f"Storage Table: `{db_mig_info.get('storage_table', 'N/A')}` | "
+                f"Conversion Factor en BD: `{db_mig_info.get('conversion_factor', 'N/A')}` | "
+                f"Decimal Separator: `{db_mig_info.get('decimal_separator', 'N/A')}`"
             )
 
-        st.markdown("---")
-        st.subheader("⚙️ Opciones de Ejecución Remota")
-        gen_dag_remote = st.checkbox(
-            "🚀 Ejecutar generador de DAG en Docker automáticamente tras la subida",
-            value=True,
-            help="Ejecuta: printf '1\n1\nCODIGO\n' | docker compose exec -T airflow-worker python include/main-generate.py"
-        )
+        col_st1, col_st2, col_st3, col_st4 = st.columns(4)
+        col_st1.metric("Familia", mig_parent_code)
+        col_st2.metric("Reporte", sel_report)
+        col_st3.metric("Robot .py", "🟢 Presente" if has_py else "🔴 Pendiente")
+        col_st4.metric("DDL .sql", "🟢 Presente" if has_sql else "🔴 Pendiente")
 
-        if st.button(f"🚀 Desplegar {selected_deploy_code} al Servidor", type="primary", use_container_width=True):
-            if not ssh_pass:
-                st.error("❌ Por favor ingresa la contraseña de datax-pds antes de desplegar.")
-            else:
-                st.write("---")
-                log_placeholder = st.empty()
-                live_logs = []
+        tab_vm_code, tab_vm_deploy = st.tabs([
+            "📄 1. Previsualizar / Editar Código (.sql & .py)",
+            "🚀 2. Guardar & Desplegar al Servidor"
+        ])
 
-                def update_live_log(msg: str):
-                    live_logs.append(msg)
-                    log_placeholder.code("\n".join(live_logs), language="bash")
+        with tab_vm_code:
+            st.subheader(f"Archivos de Migración para `{sel_report}` en `models/migration/{mig_parent_code}/`")
+            col_vpr1, col_vpr2 = st.columns(2)
+            with col_vpr1:
+                st.markdown(f"**DDL SQL:** `{sel_report}.sql`")
+                sql_input_v2 = st.text_area("Contenido SQL DDL:", value=sql_content_v2 if has_sql else "-- DDL SQL para tabla de PostgreSQL\n", height=380, key=f"ta_sql_v2_{sel_report}")
+            with col_vpr2:
+                st.markdown(f"**Robot Python:** `{sel_report}.py`")
+                py_input_v2 = st.text_area("Contenido Python del Robot:", value=py_content_v2 if has_py else "# Robot de migración a PostgreSQL\n", height=380, key=f"ta_py_v2_{sel_report}")
 
-                with st.spinner(f"Subiendo {selected_deploy_code} y ejecutando tareas en {ssh_host}..."):
-                    res_deploy = deploy_robot_to_server(
-                        host=ssh_host,
-                        port=int(ssh_port),
-                        username=ssh_user,
-                        password=ssh_pass,
-                        remote_base_path=ssh_remote_path,
-                        process_type=proc_key,
-                        robot_code=selected_deploy_code,
-                        local_dir=selected_deploy_robot["folder_path"],
-                        generate_dag=gen_dag_remote,
-                        log_callback=update_live_log
-                    )
+            if st.button(f"💾 Guardar Archivos en models/migration/{mig_parent_code}/", type="primary", key=f"btn_save_v2_mig_{sel_report}"):
+                saved_sql, saved_py = save_migration_files(
+                    repo_path=new_repo,
+                    parent_code=mig_parent_code,
+                    report_code=sel_report,
+                    sql_content=sql_input_v2,
+                    py_content=py_input_v2
+                )
+                st.success(f"✨ Archivos guardados exitosamente:\n- `{saved_sql}`\n- `{saved_py}`")
+                st.rerun()
 
-                if res_deploy["success"]:
-                    st.success(f"🎉 ¡Robot `{selected_deploy_code}` desplegado exitosamente en el servidor!")
-                    if res_deploy["dag_generated"]:
-                        st.balloons()
-                        st.info(f"✅ DAG generado y registrado en Airflow: `/opt/airflow/dags/{proc_key}/{selected_deploy_code}.py`")
+        with tab_vm_deploy:
+            st.subheader(f"Despliegue y Ejecución en Servidor para `{mig_parent_code}`")
+            col_vd1, col_vd2 = st.columns(2)
+            with col_vd1:
+                dep_mig_host = st.text_input("Host Servidor:", value=DEFAULT_SSH_HOST, key=f"v2_dep_mig_host_{sel_report}")
+                dep_mig_user = st.text_input("Usuario SSH:", value=DEFAULT_SSH_USER, key=f"v2_dep_mig_user_{sel_report}")
+            with col_vd2:
+                dep_mig_port = st.number_input("Puerto SSH:", value=DEFAULT_SSH_PORT, key=f"v2_dep_mig_port_{sel_report}")
+                mig_ssh_pass_v2 = st.text_input("Contraseña SSH (datax-pds):", value=DEFAULT_SSH_PASS, type="password", key=f"v2_mig_ssh_pass_{sel_report}")
+
+            if st.button(f"🚀 Desplegar {mig_parent_code} y Generar DAG en Servidor", type="primary", use_container_width=True, key=f"btn_dep_v2_mig_{sel_report}"):
+                if not mig_ssh_pass_v2:
+                    st.error("Ingresa la contraseña de SSH para desplegar.")
                 else:
-                    st.error("⚠️ Ocurrieron errores durante el despliegue. Revisa los logs arriba.")
+                    local_mig_dir = os.path.join(new_repo, "models", "migration", mig_parent_code)
+                    if not os.path.isdir(local_mig_dir):
+                        st.error(f"No existe la carpeta local `{local_mig_dir}`. Guarda los archivos en el paso 1 primero.")
+                    else:
+                        with st.spinner("Desplegando en el servidor..."):
+                            deploy_res = deploy_robot_to_server(
+                                host=dep_mig_host,
+                                port=int(dep_mig_port),
+                                username=dep_mig_user,
+                                password=mig_ssh_pass_v2,
+                                process_type="migration",
+                                robot_code=mig_parent_code,
+                                local_dir=local_mig_dir,
+                                generate_dag=True
+                            )
+                        if deploy_res["success"]:
+                            show_deploy_success_banner(mig_parent_code, process_type="Robot de Migración", dag_id=mig_parent_code)
+                        else:
+                            st.error(f"Error en despliegue: {deploy_res['error']}")
+                        with st.expander("Ver logs de despliegue"):
+                            st.text("\n".join(deploy_res["logs"]))
+
+            st.markdown("---")
+            st.markdown("#### ⚡ Disparar DAG en Airflow")
+            st.caption("Ejecuta el DAG de migración en Airflow con la última conversión registrada o parámetros manuales.")
+
+            latest_conv_v2 = get_latest_conversion_for_report(sel_report, engine) if (db_connected and engine is not None) else None
+            if latest_conv_v2:
+                st.info(
+                    f"🎯 **Última Conversión detectada en BD:** ID `{latest_conv_v2['id_conversion']}` | "
+                    f"Corte: **`{latest_conv_v2['converted_to']}`**\n\n"
+                    f"📁 Archivo: `{latest_conv_v2['conversion_path']}`"
+                )
+                def_conv_id_v2 = latest_conv_v2["id_conversion"]
+                def_conv_path_v2 = latest_conv_v2["conversion_path"]
+            else:
+                def_conv_id_v2 = 1
+                parts = mig_parent_code.split("_")
+                c_tag = parts[1] if len(parts) > 1 else "BO"
+                def_conv_path_v2 = f"/mnt/datos1/data_process/{c_tag}/{mig_parent_code.replace('M_', 'D_')}/{sel_report}.sqlite"
+
+            col_vmt1, col_vmt2 = st.columns(2)
+            with col_vmt1:
+                trig_code_v2 = st.text_input("Código reporte (--conf 'code'):", value=sel_report, key=f"v2_trig_code_{sel_report}")
+                trig_id_v2 = st.number_input("ID conversión (--conf 'id_conversion'):", value=def_conv_id_v2, step=1, key=f"v2_trig_id_{sel_report}")
+            with col_vmt2:
+                trig_path_v2 = st.text_input("Ruta SQLite (--conf 'conversion_path'):", value=def_conv_path_v2, key=f"v2_trig_path_{sel_report}")
+
+            if st.button(f"▶️ Disparar DAG {mig_parent_code} en Airflow", use_container_width=True, key=f"btn_trig_v2_mig_{sel_report}"):
+                if not mig_ssh_pass_v2:
+                    st.error("Ingresa la contraseña de SSH arriba para conectar al servidor.")
+                else:
+                    conf_payload_v2 = {
+                        "code": trig_code_v2,
+                        "id_conversion": int(trig_id_v2),
+                        "conversion_path": trig_path_v2
+                    }
+                    corte_v2_str = f" con corte {latest_conv_v2['converted_to']}" if latest_conv_v2 else ""
+                    with st.spinner(f"Disparando DAG {mig_parent_code} en Airflow worker{corte_v2_str}..."):
+                        trig_res_v2 = trigger_dag_on_server(
+                            host=dep_mig_host,
+                            port=int(dep_mig_port),
+                            username=dep_mig_user,
+                            password=mig_ssh_pass_v2,
+                            dag_id=mig_parent_code,
+                            conf=conf_payload_v2
+                        )
+                    if trig_res_v2["success"]:
+                        st.success(f"🎉 DAG `{mig_parent_code}` disparado exitosamente{corte_v2_str}!")
+                    else:
+                        st.warning("El comando terminó con advertencias o error.")
+                    with st.expander("Ver logs de disparo de Airflow", expanded=True):
+                        st.code(trig_res_v2["output"] or "Sin salida de terminal.")
+
+# elif "Migración por Lote" in mode:
+#     st.header("📊 Migración Masiva por Lote (Batch)")
+#     st.caption("Migra múltiples robots de descarga o conversión de una sola vez.")
+# 
+#     batch_type = st.radio("Tipo de proceso a migrar en lote:", ["Descarga", "Conversión"], horizontal=True)
+# 
+#     if batch_type == "Descarga":
+#         dl_robots = scan_old_download_robots(old_repo)
+#         st.write(f"Total robots encontrados en repo antiguo: **{len(dl_robots)}**")
+# 
+#         if st.button("🚀 Iniciar Migración por Lote de Descarga", type="primary"):
+#             progress_bar = st.progress(0)
+#             status_text = st.empty()
+#             results = []
+# 
+#             for i, r in enumerate(dl_robots):
+#                 code = r["code"]
+#                 status_text.write(f"Procesando {i+1}/{len(dl_robots)}: {code}...")
+#                 if r["script_file"]:
+#                     res = apply_download_migration(
+#                         code=code,
+#                         source_file=r["script_file"],
+#                         new_repo_path=new_repo,
+#                         skip_test=True, # Lote rápido
+#                         skip_dag=True
+#                     )
+#                     results.append({"Código": code, "Estado": "🟢 OK" if res["success"] else "⚠️ Revisión"})
+#                 progress_bar.progress((i + 1) / len(dl_robots))
+# 
+#             status_text.success("¡Proceso por lote completado!")
+#             safe_dataframe(pd.DataFrame(results), use_container_width=True)
+
+
+

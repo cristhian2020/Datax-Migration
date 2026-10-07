@@ -786,3 +786,80 @@ def get_latest_conversion_for_report(report_code: str, engine) -> Optional[Dict]
         print(f"Error al consultar latest conversion: {exc}")
         return None
 
+
+def scan_existing_migration_robots(repo_path: str) -> List[Dict]:
+    """Escanea models/migration/ en busca de robots de migración existentes en el repositorio V2."""
+    mig_dir = os.path.join(repo_path, "models", "migration")
+    if not os.path.isdir(mig_dir):
+        return []
+
+    families = []
+    for item in sorted(os.listdir(mig_dir)):
+        item_path = os.path.join(mig_dir, item)
+        if not os.path.isdir(item_path):
+            continue
+
+        match = re.search(r"(M_[A-Z]{2}_\d{9})", item)
+        if not match:
+            continue
+
+        parent_code = match.group(1)
+        reports = []
+
+        for f in sorted(os.listdir(item_path)):
+            fpath = os.path.join(item_path, f)
+            if not os.path.isfile(fpath):
+                continue
+            lower = f.lower()
+            if lower.endswith(".py") and not lower.startswith("__"):
+                rep_match = re.search(r"(D_[A-Z]{2}_\d{9}_\d{2})", f)
+                rep_code = rep_match.group(1) if rep_match else os.path.splitext(f)[0]
+                sql_path = os.path.join(item_path, f"{rep_code}.sql")
+                reports.append({
+                    "code": rep_code,
+                    "py_file": fpath,
+                    "sql_file": sql_path if os.path.isfile(sql_path) else None,
+                    "has_sql": os.path.isfile(sql_path)
+                })
+
+        if reports:
+            families.append({
+                "parent_code": parent_code,
+                "folder": item_path,
+                "reports": reports
+            })
+
+    return families
+
+
+def load_migration_robot_files(repo_path: str, parent_code: str, report_code: str) -> Dict[str, str]:
+    """Lee el contenido de los archivos .sql y .py existentes de un robot de migración."""
+    folder = os.path.join(repo_path, "models", "migration", parent_code)
+    py_path = os.path.join(folder, f"{report_code}.py")
+    sql_path = os.path.join(folder, f"{report_code}.sql")
+
+    py_content = ""
+    sql_content = ""
+
+    if os.path.isfile(py_path):
+        try:
+            with open(py_path, "r", encoding="utf-8", errors="ignore") as f:
+                py_content = f.read()
+        except Exception:
+            pass
+
+    if os.path.isfile(sql_path):
+        try:
+            with open(sql_path, "r", encoding="utf-8", errors="ignore") as f:
+                sql_content = f.read()
+        except Exception:
+            pass
+
+    return {
+        "py_content": py_content,
+        "sql_content": sql_content,
+        "py_path": py_path,
+        "sql_path": sql_path
+    }
+
+

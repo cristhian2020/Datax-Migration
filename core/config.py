@@ -11,11 +11,23 @@ except ImportError:
 
 DEFAULT_OLD_REPO = os.getenv("OLD_REPO_PATH", r"tu ruta")
 DEFAULT_NEW_REPO = os.getenv("NEW_REPO_PATH", r"tu ruta")
-DEFAULT_DB_HOST = os.getenv("DB_HOST", "10.0.0.16")
+# Fallbacks genéricos para credenciales y host
+_GENERIC_HOST = os.getenv("HOST", "10.0.0.16")
+_GENERIC_USER = os.getenv("USER", "")
+_GENERIC_PASS = os.getenv("PASSWORD", "")
+
+# Base de datos
+DEFAULT_DB_HOST = os.getenv("DB_HOST", _GENERIC_HOST)
 DEFAULT_DB_PORT = int(os.getenv("DB_PORT", 5434))
-DEFAULT_DB_USER = os.getenv("DB_USER", "postgres")
-DEFAULT_DB_PASS = os.getenv("DB_PASS", "datax")
+DEFAULT_DB_USER = os.getenv("DB_USER", _GENERIC_USER or "postgres")
+DEFAULT_DB_PASS = os.getenv("DB_PASS", _GENERIC_PASS or "datax")
 DEFAULT_DB_NAME = os.getenv("DB_NAME", "platform_db")
+
+# Servidor Remoto (SSH / Despliegue / Airflow)
+DEFAULT_SSH_HOST = os.getenv("SSH_HOST", _GENERIC_HOST)
+DEFAULT_SSH_PORT = int(os.getenv("SSH_PORT", os.getenv("PORT", 22)))
+DEFAULT_SSH_USER = os.getenv("SSH_USER", os.getenv("SSH_USERNAME", _GENERIC_USER or "datax-pds"))
+DEFAULT_SSH_PASS = os.getenv("SSH_PASS", os.getenv("SSH_PASSWORD", _GENERIC_PASS or ""))
 
 DEFAULT_GITHUB_REPO = os.getenv("GITHUB_REPO", "datax-platform/data-processing-modules")
 DEFAULT_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
