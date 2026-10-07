@@ -64,7 +64,7 @@ def get_conversion_db_info(report_code: str, engine) -> Optional[Dict]:
     query = f"""
         SELECT id_report, code, name, page_number, decimal_separator, 
                key_words, path, storage_table, replacement_table,
-               converted_report_path, is_active
+               converted_report_path, "isActive" AS is_active
         FROM report 
         WHERE code = '{report_code}';
     """
@@ -80,6 +80,8 @@ def get_conversion_db_info(report_code: str, engine) -> Optional[Dict]:
 def refactor_conversion_code(raw_code: str, report_code: str) -> str:
     """Aplica las reglas de estandarización V2 del Paso 4 de 'Creacion DAG Covnersion.md'."""
     code_content = raw_code
+    base_name = "Conversion_Base"
+    official_import = "from models.conversion.Conversion_Base import Conversion_Base"
 
     # 1. Eliminar sys.path.append viejos o rutas relativas
     code_content = re.sub(r"sys\.path\.append\([^)]*\)\s*", "", code_content)
@@ -93,51 +95,132 @@ def refactor_conversion_code(raw_code: str, report_code: str) -> str:
     code_content = re.sub(r"\bfrom\s+download_tools\b", "from models.download.tools.download_tools", code_content)
     code_content = re.sub(r"\bimport\s+download_tools\b", "import models.download.tools.download_tools as download_tools", code_content)
 
-    # 3. Limpiar cualquier import previo o try/except obsoleto de Conversion_Base
-    # a) Eliminar bloques try/except obsoletos de la vieja fábrica
-    code_content = re.sub(
-        r"try:\s*\n\s*from\s+models\.conversion(?:\.Conversion_Base)?\s+import\s+Conversion_Base\s*\nexcept[^\n]*:.*?(?=\n\S|\Z)",
-        "",
-        code_content,
-        flags=re.DOTALL
-    )
-    # b) Eliminar imports sueltos previos (incluyendo el erróneo 'from models.conversion import Conversion_Base')
-    code_content = re.sub(
-        r"^[ \t]*from\s+models\.conversion(?:\.Conversion_Base)?\s+import\s+Conversion_Base[^\n]*\n?",
-        "",
-        code_content,
-        flags=re.MULTILINE
-    )
-    # c) Asegurar un único import oficial y limpio al inicio del archivo
-    code_content = "from models.conversion.Conversion_Base import Conversion_Base\n" + code_content.lstrip()
+    # 3. Separar header (antes de la clase principal) del cuerpo
+    class_match = re.search(r"^[ \t]*class\s+[A-Za-z0-9_]+", code_content, flags=re.MULTILINE)
+    if class_match:
+        header = code_content[:class_match.start()]
+        body = code_content[class_match.start():]
+    else:
+        header = code_content
+        body = ""
 
-    # 4. Renombrar clase principal a <REPORT_CODE>(Conversion_Base)
-    # Soporta class Robot:, class Robot():, class Robot(Conversion_Base):, class Executor_...:, etc.
+    lines = header.splitlines()
+    new_header_lines = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # Si encontramos un bloque 'try:' en el header
+        if stripped == "try:":
+            try_lines = []
+            except_lines = []
+            in_except = False
+            j = i + 1
+
+            while j < n:
+                cur_line = lines[j]
+                cur_stripped = cur_line.strip()
+
+                if cur_stripped and not cur_line.startswith((" ", "\t")):
+                    if cur_stripped.startswith("except"):
+                        in_except = True
+                        except_lines.append(cur_line)
+                        j += 1
+                        continue
+                    else:
+                        break
+
+                if in_except:
+                    except_lines.append(cur_line)
+                else:
+                    try_lines.append(cur_line)
+                j += 1
+
+            all_block_text = "\n".join(try_lines + except_lines)
+
+            # Si envuelve Conversion_Base: descartar todo el bloque obsoleto
+            if base_name.lower() in all_block_text.lower():
+                i = j
+                continue
+
+            # Si envuelve conversion_tools / download_tools: extraer solo los imports limpios
+            if "conversion_tools" in all_block_text or "download_tools" in all_block_text:
+                for tl in try_lines:
+                    if tl.strip().startswith(("from ", "import ")):
+                        new_header_lines.append(tl.strip())
+                i = j
+                continue
+
+            # Si es otro bloque try:, conservarlo
+            new_header_lines.append(line)
+            new_header_lines.extend(try_lines)
+            new_header_lines.extend(except_lines)
+            i = j
+            continue
+
+        # Eliminar imports sueltos de Conversion_Base
+        if (stripped.startswith("from ") or stripped.startswith("import ")) and base_name.lower() in stripped.lower():
+            i += 1
+            continue
+
+        # Eliminar asignaciones Conversion_Base = object
+        if re.match(rf"^{base_name}\s*=\s*object\b", stripped, re.IGNORECASE):
+            i += 1
+            continue
+
+        new_header_lines.append(line)
+        i += 1
+
+    cleaned_header = "\n".join(new_header_lines).strip()
+
+    # 4. Asegurar exactamente un import oficial limpio al inicio
+    code_content = f"{official_import}\n{cleaned_header}\n\n{body}"
+
+    # 5. Renombrar clase principal a <REPORT_CODE>(Conversion_Base)
     class_pattern = r"class\s+([A-Za-z0-9_]+)(?:\s*\([^)]*\))?\s*:"
-    matches = list(re.finditer(class_pattern, code_content))
-    for m in matches:
+    m = re.search(class_pattern, code_content)
+    if m:
         cls_name = m.group(1)
         if cls_name != report_code:
             full_match = m.group(0)
-            code_content = code_content.replace(full_match, f"class {report_code}(Conversion_Base):", 1)
-            break
+            code_content = code_content.replace(full_match, f"class {report_code}({base_name}):", 1)
 
-    # 5. Asegurar traceback.print_exc() en bloques except si falta
+    # 6. Limpiar traceback.print_exc() inyectados en bloques de control de flujo (ej. except ValueError)
+    lines = code_content.splitlines()
+    cleaned_lines = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        cleaned_lines.append(line)
+        if re.search(r"^\s*except\s+(?:\([^)]*\bValueError\b[^)]*\)|ValueError\b)", line):
+            if i + 1 < n and "traceback.print_exc()" in lines[i + 1]:
+                i += 1
+        i += 1
+    code_content = "\n".join(cleaned_lines)
+
+    # 7. Asegurar traceback.print_exc() SOLO en bloques de excepciones generales (Exception)
     lines = code_content.splitlines()
     new_lines = []
     for i, line in enumerate(lines):
         new_lines.append(line)
-        if re.search(r"^\s*except(\s+.*)?:", line):
+        if re.search(r"^\s*except\s+(?:Exception\b|as\b\s*\w+)", line, re.IGNORECASE):
             next_block = "\n".join(lines[i + 1 : i + 4])
             if "print_exc" not in next_block:
                 indent = re.match(r"^(\s*)", line).group(1) + "    "
                 new_lines.append(f"{indent}import traceback; traceback.print_exc()")
     code_content = "\n".join(new_lines)
 
-    # 6. Agregar alias al pie de compatibilidad
+    # 8. Limpiar cualquier alias huérfano previo para evitar NameError
+    code_content = re.sub(r'^[ \t]*Robot\s*=\s*[A-Za-z0-9_]+[^\n]*\n?', '', code_content, flags=re.MULTILINE)
+    code_content = re.sub(r'^[ \t]*Executor_[A-Za-z0-9_]+\s*=\s*[A-Za-z0-9_]+[^\n]*\n?', '', code_content, flags=re.MULTILINE)
+
+    # 9. Agregar alias oficiales limpios al pie
     alias_footer = f"\n\nExecutor_{report_code} = {report_code}\nRobot = {report_code}\n"
-    if f"Executor_{report_code} = {report_code}" not in code_content:
-        code_content += alias_footer
+    code_content = code_content.rstrip() + alias_footer
 
     return code_content
 
@@ -207,12 +290,15 @@ def run_conversion_step_test(
     sqlite_path = os.path.join(new_repo_path, "models", "conversion", parent_code, f"{report_code}.sqlite")
     sqlite_exists = os.path.isfile(sqlite_path)
 
+    diagnostics = diagnose_conversion_test_failure(res.stdout, res.stderr, report_code) if res.returncode != 0 else []
+
     return {
         "success": res.returncode == 0,
         "stdout": res.stdout,
         "stderr": res.stderr,
         "sqlite_created": sqlite_exists,
-        "sqlite_path": sqlite_path if sqlite_exists else None
+        "sqlite_path": sqlite_path if sqlite_exists else None,
+        "diagnostics": diagnostics
     }
 
 
@@ -632,3 +718,66 @@ def get_latest_download_for_report(report_code: str, engine) -> Optional[Dict]:
         }
     except Exception as exc:
         return None
+
+
+def diagnose_conversion_test_failure(stdout: str, stderr: str, report_code: str) -> List[str]:
+    """Diagnostica fallos en tests de conversión y devuelve sugerencias accionables."""
+    output = f"{stdout}\n{stderr}"
+    diagnostics = []
+
+    if "NameError: name" in output and "is not defined" in output:
+        match = re.search(r"name '([^']+)' is not defined", output)
+        missing_name = match.group(1) if match else "desconocido"
+        diagnostics.append(
+            f"⚠️ **NameError detectado (`{missing_name}`):**\n"
+            f"   - **Causa:** El código hace referencia a una variable o clase que no existe (ej. un alias residual `Robot = {missing_name}`).\n"
+            f"   - **Solución:** Guarda nuevamente el código desde el Paso 1 para que el refactor limpie los alias automáticamente."
+        )
+
+    if "TypeError: module() takes at most 2 arguments" in output or "cannot import name 'Conversion_Base'" in output:
+        diagnostics.append(
+            "⚠️ **Error de Importación de Conversion_Base:**\n"
+            "   - **Causa:** Import incorrecto `from models.conversion import Conversion_Base`.\n"
+            "   - **Solución:** Debe ser estrictamente `from models.conversion.Conversion_Base import Conversion_Base`."
+        )
+
+    if "validate_data_results" in output or "AssertionError: True is not false" in output:
+        diagnostics.append(
+            "⚖️ **Fallo en Validación Matemática (Sumas / Tolerancia):**\n"
+            "   - **Causa:** `validate_data_results()` retornó `True` (indicando inconsistencia en las sumas por fecha).\n"
+            "   - **Regla DATAX:** La función debe retornar `False` cuando los datos son consistentes y cuadran matemáticamente.\n"
+            "   - **Solución:** Revisa si la suma de los componentes individuales difiere del Total General por más de la tolerancia (`TOLERANCE=6.0`)."
+        )
+
+    if "No such file or directory" in output or "FileNotFoundError" in output:
+        diagnostics.append(
+            "📁 **Archivo de muestra no encontrado:**\n"
+            "   - **Causa:** La ruta del archivo de muestra (.xlsx/.pdf) no existe o no tiene permisos de lectura.\n"
+            "   - **Solución:** Sube una muestra válida en el Paso 1 o usa la muestra descargada automáticamente de la base de datos."
+        )
+
+    if "IndexError" in output or "KeyError" in output:
+        diagnostics.append(
+            "🔍 **Error de Índices o Columnas en Extracción:**\n"
+            "   - **Causa:** El DataFrame extraído no tiene la estructura de columnas o filas esperada por el robot.\n"
+            "   - **Solución:** Verifica que el número de página sea correcto y que las cabeceras coincidan con la muestra actual."
+        )
+
+    if not diagnostics and ("FAIL" in output or "ERROR" in output):
+        diagnostics.append(
+            "⚠️ **Excepción durante la prueba:** Revisa la traza completa (traceback) mostrada a continuación."
+        )
+
+    return diagnostics
+
+
+def reset_report_migrated_to_in_db(report_code: str, engine) -> Dict:
+    """Resetea el campo 'migrated_to' a NULL en la tabla 'report' para permitir re-migraciones limpias en PostgreSQL."""
+    try:
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            sql = text("UPDATE report SET migrated_to = NULL WHERE code = :code;")
+            conn.execute(sql, {"code": report_code})
+            return {"success": True, "message": f"Campo 'migrated_to' de {report_code} reseteado a NULL exitosamente."}
+    except Exception as exc:
+        return {"success": False, "message": f"Error al actualizar BD: {exc}"}

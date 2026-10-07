@@ -41,6 +41,8 @@ from core.migrator_download import (
     get_download_db_info,
     refactor_download_code,
     apply_download_migration,
+    generate_download_dag_only,
+    reset_file_updated_to_in_db,
 )
 from core.migrator_conversion import (
     scan_old_conversion_families,
@@ -58,6 +60,7 @@ from core.migrator_conversion import (
     setup_columns_to_review,
     apply_conversion_migration,
     get_latest_download_for_report,
+    reset_report_migrated_to_in_db,
 )
 from core.migrator_migration import (
     scan_conversion_outputs,
@@ -238,18 +241,60 @@ if "Robots de Descarga" in mode:
                 st.subheader("Código Estandarizado (V2)")
                 st.code(refactored_code, language="python")
 
+        # Gestión de BD para el robot de descarga
+        if db_connected:
+            with st.expander(f"🛠️ Gestión de Base de Datos para `{selected_code}`", expanded=False):
+                c_db1, c_db2 = st.columns([3, 1])
+                with c_db1:
+                    new_db_dt = st.text_input("Nueva fecha 'updated_to' (o 'NULL' para resetear)", value="2024-01-01", key=f"db_dt_{selected_code}")
+                with c_db2:
+                    st.write("")
+                    st.write("")
+                    if st.button("💾 Actualizar en BD", key=f"btn_upd_db_{selected_code}", use_container_width=True):
+                        upd_res = reset_file_updated_to_in_db(selected_code, new_db_dt, engine)
+                        if upd_res["success"]:
+                            st.success(upd_res["message"])
+                            st.rerun()
+                        else:
+                            st.error(upd_res["message"])
+
         with tab_action:
             st.subheader("Opciones de Migración")
-            skip_test = st.checkbox("Omitir test unitario (migrar solo archivos y DAG)", value=False)
-            generate_dag = st.checkbox("Generar DAG de Airflow en dags/download", value=False, help="Por el momento desactivado por defecto para solo crear el archivo en models/download")
+            c_opt1, c_opt2 = st.columns(2)
+            with c_opt1:
+                skip_test = st.checkbox("Omitir test unitario (migrar solo archivos y DAG)", value=False)
+            with c_opt2:
+                generate_dag = st.checkbox("Generar DAG de Airflow en dags/download", value=True, help="Genera automáticamente el DAG en dags/download/<CODE>.py")
             skip_dag = not generate_dag
-            test_date = st.text_input("Fecha de corte para la prueba", value="2024-01-01")
+
+            # Selector inteligente de fechas de corte
+            st.markdown("**📅 Fecha de corte para la prueba (`UPDATED_TO`):**")
+            st.caption("ℹ️ El test exige encontrar al menos un archivo posterior a esta fecha. Selecciona una fecha anterior a la última publicación para asegurar que el scraper pase.")
+            
+            db_date_val = str(db_info.get("updated_to", "")) if db_info and db_info.get("updated_to") else "2024-01-01"
+            
+            c_dt1, c_dt2, c_dt3 = st.columns(3)
+            with c_dt1:
+                if st.button("⏪ 1 año antes (Recomendado)", key=f"dt_1y_{selected_code}", use_container_width=True):
+                    st.session_state[f"test_date_{selected_code}"] = "2024-01-01"
+                    st.rerun()
+            with c_dt2:
+                if st.button("📜 Histórico (2020-01-01)", key=f"dt_hist_{selected_code}", use_container_width=True):
+                    st.session_state[f"test_date_{selected_code}"] = "2020-01-01"
+                    st.rerun()
+            with c_dt3:
+                if st.button("📅 Fecha en BD", key=f"dt_db_{selected_code}", use_container_width=True):
+                    st.session_state[f"test_date_{selected_code}"] = db_date_val
+                    st.rerun()
+
+            current_test_date = st.session_state.get(f"test_date_{selected_code}", "2024-01-01")
+            test_date = st.text_input("Fecha seleccionada para la prueba:", value=current_test_date, key=f"input_dt_{selected_code}")
 
             col_btn1, col_btn2 = st.columns(2)
             if col_btn1.button("🧪 Simulación (Dry-Run)", use_container_width=True):
                 st.info(f"Simulación exitosa: {selected_code} listo para migrarse a `{new_robot_path}`.")
 
-            if col_btn2.button("🚀 Migrar Robot (Crear en models/download)", type="primary", use_container_width=True):
+            if col_btn2.button("🚀 Migrar Robot y Ejecutar Prueba", type="primary", use_container_width=True):
                 with st.spinner("Procesando migración, ejecutando pruebas y creando DAG..."):
                     res = apply_download_migration(
                         code=selected_code,
@@ -260,12 +305,33 @@ if "Robots de Descarga" in mode:
                         skip_dag=skip_dag,
                         test_updated_to=test_date
                     )
+                    st.session_state[f"last_dl_res_{selected_code}"] = res
                     if res["success"]:
                         st.success(f"✨ ¡Robot {selected_code} migrado exitosamente a la Plataforma V2!")
                     else:
                         st.error(f"⚠️ Ocurrieron advertencias o fallos durante la migración.")
 
-                    for l in res["logs"]:
+            # Mostrar resultados guardados en session_state para permitir rescate
+            last_res = st.session_state.get(f"last_dl_res_{selected_code}")
+            if last_res:
+                if last_res.get("diagnostics"):
+                    st.markdown("### 🩺 Diagnóstico Inteligente de Fallos")
+                    for d in last_res["diagnostics"]:
+                        st.warning(d)
+
+                if not last_res["success"] and last_res.get("can_force_dag"):
+                    st.markdown("---")
+                    st.info("💡 El archivo `.py` ya fue guardado en `models/download`. Si el fallo se debe a que el portal web no tiene archivos nuevos hoy o requieres desplegarlo, puedes generar el DAG directamente:")
+                    if st.button("🚀 Forzar Generación de DAG (Omitir fallo de fecha)", key=f"force_dag_{selected_code}", type="secondary", use_container_width=True):
+                        with st.spinner("Generando DAG en dags/download..."):
+                            f_res = generate_download_dag_only(selected_code, new_repo)
+                            if f_res["success"]:
+                                st.success(f_res["message"])
+                            else:
+                                st.error(f_res["message"])
+
+                with st.expander("📋 Ver logs completos de la migración", expanded=not last_res["success"]):
+                    for l in last_res["logs"]:
                         st.write(l)
 
 # ─── PESTAÑA 2: CONVERSIÓN (ASISTENTE POR PASOS) ───────────────
@@ -598,6 +664,10 @@ elif "Robots de Conversión" in mode:
                                 st.success(f"📁 Archivo SQLite generado exitosamente: `{t1_res['sqlite_path']}`")
                         else:
                             st.error("❌ El test de extracción pura falló.")
+                            if t1_res.get("diagnostics"):
+                                st.markdown("### 🩺 Diagnóstico Inteligente:")
+                                for d in t1_res["diagnostics"]:
+                                    st.warning(d)
 
                         with st.expander("Ver logs de la prueba (stdout / stderr)", expanded=not t1_res["success"]):
                             if t1_res["stdout"]:
@@ -620,6 +690,10 @@ elif "Robots de Conversión" in mode:
                             st.info("Se ha creado/actualizado la tabla de reemplazos en `DATA_DB_BO_AUX`.")
                         else:
                             st.error("❌ El test con reemplazos falló.")
+                            if t2_res.get("diagnostics"):
+                                st.markdown("### 🩺 Diagnóstico Inteligente:")
+                                for d in t2_res["diagnostics"]:
+                                    st.warning(d)
 
                         with st.expander("Ver logs de la prueba (stdout / stderr)", expanded=not t2_res["success"]):
                             if t2_res["stdout"]:
