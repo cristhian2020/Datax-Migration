@@ -725,7 +725,7 @@ def validate_and_sanitize_agent_result(
     words = set(re.split(r'[\\s/()]+', nv_all))
     if 'ufv' in words:
         return 'UFV'
-    if any(k in nv_all for k in ['usd', 'dolar', 'dólar', 'me', 'moneda extranjera']):
+    if any(w in words for w in ['usd', 'dolar', 'dólar', 'me', 'm.e.']) or 'moneda extranjera' in nv_all:
         return 'USD'
     return 'BOB'"""
 
