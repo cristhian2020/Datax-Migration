@@ -290,6 +290,26 @@ Tu misión es analizar la estructura y datos de un reporte financiero/económico
    - Solución obligatoria DATAX: base_metric: "moneda", base_unit: "BOB", is_mixed: true, factor: 1000.0.
      get_unit devuelve 'BOB' para MN, 'USD' para ME, 'UFV' para UFV.
 
+4. Balances Financieros con Coeficientes, Ratios o Porcentajes (ej. Ponderación de Activos y Suficiencia Patrimonial - Robot 321):
+   - Categorías: ["Activos Ponderados por Riesgo", "Capital Primario Inicial", "Coeficiente de Adecuación Patrimonial", "Coeficiente de Ponderación del Activo", "Coeficiente de Inversión en Activos FIJOS... (Limite Max. 100%)"]
+   - Solución obligatoria DATAX:
+     * is_mixed: true (¡OBLIGATORIAMENTE true! JAMÁS unificar todo a moneda porque los coeficientes/ratios no son dinero).
+     * base_metric: "moneda"
+     * base_unit: "BOB"
+     * conversion_factor: 1.0 (¡OBLIGATORIAMENTE 1.0! Jamás multiplicar por miles o millones un balance donde conviven coeficientes o porcentajes).
+     * get_metric_code:
+       def get_metric(row) -> str:
+           nv1 = str(row.get('nv1', '')).lower()
+           if 'coeficiente' in nv1 or 'ratio' in nv1:
+               return 'porcentaje'
+           return 'moneda'
+     * get_unit_code:
+       def get_unit(row) -> str:
+           nv1 = str(row.get('nv1', '')).lower()
+           if 'coeficiente' in nv1 or 'ratio' in nv1:
+               return '%'
+           return 'BOB'
+
 ### Reglas Oficiales de DATAX V2:
 1. 'metrica' (character varying 255):
    - 'precio': Cotizaciones internacionales, futuros o commodities por unidad física (ej. USD/Tn, GBP/Tn, EUR/Tn, USD/Bbl, USc/lb). En estos reportes la métrica DEBE SER 'precio' (¡NUNCA 'moneda' ni 'volumen'!), la unidad DEBE SER la razón combinada Moneda/Unidad y el factor SIEMPRE ES 1.0.
@@ -302,6 +322,9 @@ Tu misión es analizar la estructura y datos de un reporte financiero/económico
    - 'ratio': Coeficientes o multiplicadores ('veces').
 
 2. Filas Mixtas ('is_mixed'):
+   - PROHIBICIÓN ESTRICTA DE UNIFORMAR A MONEDA EN BALANCES CON COEFICIENTES O RATIOS:
+     Si en un reporte financiero conviven cuentas de balance dinerarias con conceptos como 'COEFICIENTE', 'RATIO', 'PONDERACIÓN', 'LÍMITE' o '%', el reporte ES OBLIGATORIAMENTE MIXTO (is_mixed = true). La IA NUNCA debe decir 'como la mayoría son montos monetarios, todo debe ser BOB'. Asignar BOB a un Coeficiente de Adecuación Patrimonial de 13.92% es un error inadmisible en DATAX. Debe discriminar get_metric ('porcentaje'/'ratio' vs 'moneda'), get_unit ('%' vs 'BOB'), y el conversion_factor DEBE SER estrictamente 1.0.
+
    - Si conviven diferentes unidades físicas o monedas (ej. GBP/Tn, USD/Tn, EUR/Tn), is_mixed=true.
    - get_unit(row) DEBE tener una regla explícita para CADA moneda/unidad presente en la tabla. NUNCA mapees 'Euro' a 'USD'.
    - ¡ADVERTENCIA CRÍTICA!: 'ICCO' es la Organización Internacional del Cacao, NO es una moneda. ICCO publica precios TANTO en Dólares (Us$/tonne) como en Euros (Euro/tonne). Por tanto, NUNCA clasifiques una fila como 'USD' basándote en la palabra 'icco'. Debes clasificar como 'EUR/Tn' si dice 'euro'/'eur'/'€', y como 'USD/Tn' si dice 'us$'/'$us'/'usd'.
@@ -516,21 +539,26 @@ def analyze_with_heuristic_engine(sqlite_summary: Dict[str, Any]) -> Dict[str, A
     # 5. Monedas y posibles filas mixtas
     detected_currencies = set()
     has_mixed_pct = False
-
+    has_mixed_coef = False
     for col, vals in categories.items():
         for v in vals:
             vu = v.upper()
-            words = set(re.split(r'[\s/()]+', vu))
+            words = set(re.split(r'[\\s/()]+', vu))
             if any(w in ["MN", "M.N.", "BOB", "BS", "BOLIVIANOS"] for w in words) or "MONEDA NACIONAL" in vu:
                 detected_currencies.add("BOB")
             if any(w in ["ME", "M.E.", "USD", "DOLARES", "DÓLARES", "$US"] for w in words) or "MONEDA EXTRANJERA" in vu:
                 detected_currencies.add("USD")
             if "UFV" in words:
                 detected_currencies.add("UFV")
-            if "%" in vu or "PARTICIPACI" in vu or "TASA" in vu:
+            if "%" in vu or "PARTICIPACI" in vu or "TASA" in vu or "PORCENTAJE" in vu:
                 has_mixed_pct = True
+            if any(k in vu for k in ["COEFICIENTE", "RATIO", "PONDERACI", "SUFICIENCIA", "LIMITE", "LÍMITE"]):
+                has_mixed_coef = True
 
-    is_mixed = len(detected_currencies) > 1 or has_mixed_pct
+    if has_mixed_coef or has_mixed_pct:
+        factor = 1.0
+
+    is_mixed = len(detected_currencies) > 1 or has_mixed_pct or has_mixed_coef
     base_unit = "USD" if ("USD" in detected_currencies and "BOB" not in detected_currencies) else "BOB"
 
     if is_mixed:
@@ -540,7 +568,7 @@ def analyze_with_heuristic_engine(sqlite_summary: Dict[str, Any]) -> Dict[str, A
         )
         metric_code = """def get_metric(row) -> str:
     combined = " ".join([str(v).upper() for v in row.values if pd.notna(v)])
-    if "%" in combined or "PARTICIPACI" in combined:
+    if any(k in combined for k in ["COEFICIENTE", "RATIO", "PONDERACI", "%", "PARTICIPACI", "PORCENTAJE"]):
         return "porcentaje"
     if "TASA" in combined or "RENDIMIENTO" in combined:
         return "tasa"
@@ -550,7 +578,7 @@ def analyze_with_heuristic_engine(sqlite_summary: Dict[str, Any]) -> Dict[str, A
 
         unit_code = """def get_unit(row) -> str:
     combined = " ".join([str(v).upper() for v in row.values if pd.notna(v)])
-    if "%" in combined or "PARTICIPACI" in combined:
+    if any(k in combined for k in ["COEFICIENTE", "RATIO", "PONDERACI", "%", "PARTICIPACI", "PORCENTAJE"]):
         return "%"
     words = set(re.split(r'[\\s/()]+', combined))
     if "UFV" in words:
@@ -662,6 +690,56 @@ def validate_and_sanitize_agent_result(
             parsed["get_unit_code"] = "\n".join(lines)
             parsed["get_metric_code"] = "def get_metric(row) -> str:\n    return 'precio'"
             parsed["is_mixed"] = len(set(price_units_detected.values())) > 1
+
+    # 3. Salvaguarda Oficial DATAX para Balances con Coeficientes / Ratios / Porcentajes (ej. Robot 321)
+    has_coef_or_ratio = False
+    for col, vals in categories.items():
+        for v in vals:
+            vu = v.upper()
+            if any(k in vu for k in ["COEFICIENTE", "RATIO", "PONDERACION", "PONDERACIÓN", "SUFICIENCIA PATRIMONIAL", "ADECUACION PATRIMONIAL", "ADECUACIÓN PATRIMONIAL", "LIMITE MAX", "LÍMITE MAX"]):
+                has_coef_or_ratio = True
+                break
+        if has_coef_or_ratio:
+            break
+
+    if has_coef_or_ratio:
+        # En ningún caso puede ser homogéneo en moneda pura si conviven coeficientes
+        parsed["is_mixed"] = True
+        parsed["conversion_factor"] = 1.0  # Coeficientes jamás se multiplican por miles ni millones
+        if parsed.get("base_metric") != "moneda":
+            parsed["base_metric"] = "moneda"
+        if not parsed.get("base_unit"):
+            parsed["base_unit"] = "BOB"
+
+        unit_code = parsed.get("get_unit_code", "")
+        metric_code = parsed.get("get_metric_code", "")
+
+        # Si el código de unidad devuelto por la IA no contempla coeficientes o devuelve siempre una constante:
+        # Para evitar colisiones con títulos del documento ('Ponderación') o buckets de riesgo ('Activo con Riesgo de 10%'):
+        parsed["get_unit_code"] = """def get_unit(row) -> str:
+    nv1 = str(row.get('nv1', '')).lower()
+    if 'coeficiente' in nv1 or 'ratio' in nv1:
+        return '%'
+    # Monedas en niveles jerárquicos
+    nv_all = ' '.join([str(row.get(c, '')).lower() for c in ['nv1', 'nv2', 'nv3', 'nv4', 'nv5'] if pd.notna(row.get(c))])
+    words = set(re.split(r'[\\s/()]+', nv_all))
+    if 'ufv' in words:
+        return 'UFV'
+    if any(k in nv_all for k in ['usd', 'dolar', 'dólar', 'me', 'moneda extranjera']):
+        return 'USD'
+    return 'BOB'"""
+
+        parsed["get_metric_code"] = """def get_metric(row) -> str:
+    nv1 = str(row.get('nv1', '')).lower()
+    if 'coeficiente' in nv1 or 'ratio' in nv1:
+        return 'porcentaje'
+    return 'moneda'"""
+
+        if "explanation" in parsed and "coeficiente" not in parsed["explanation"].lower():
+            parsed["explanation"] += (
+                " (Ajuste oficial DATAX: Se detectaron coeficientes y porcentajes de ponderación/suficiencia coexistiendo con saldos monetarios. "
+                "Por norma DATAX V2, el reporte es estrictamente mixto (`is_mixed: true`) para no clasificar coeficientes numéricos como montos en BOB)."
+            )
 
     # 2. Salvaguarda para TASAS DE INTERÉS
     elif any(k in all_title_text for k in ["tasas de interes", "tasas de interés", "tasas activas", "tasas pasivas"]):
