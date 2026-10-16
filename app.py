@@ -32,8 +32,21 @@ from core.config import (
     DEFAULT_SSH_PASS,
     DEFAULT_GITHUB_REPO,
     DEFAULT_GITHUB_TOKEN,
+    DEFAULT_TAIGA_HOST,
+    DEFAULT_TAIGA_USER,
+    DEFAULT_TAIGA_PASS,
+    DEFAULT_TAIGA_PROJECT_SLUG,
     get_engine,
 )
+from core.taiga_client import TaigaClient
+from core.agent_generator import (
+    AgentGenerator,
+    inspect_sample_file,
+    load_datax_rules,
+    load_doc,
+    load_example,
+)
+from core.agent_tester import test_conversion_robot_code, validate_download_robot_structure
 from core.github_client import (
     test_github_access,
     list_pull_requests,
@@ -230,11 +243,18 @@ with st.sidebar.expander("🤖 Agente IA (Google Gemini)", expanded=False):
     st.session_state["gemini_api_key"] = gemini_api_key
     st.caption("ℹ️ *Si no se ingresa clave, el Agente usará el Motor Heurístico Avanzado de forma 100% offline.*")
 
+with st.sidebar.expander("📋 Conexión Taiga Kanban", expanded=False):
+    taiga_host = st.text_input("Host Taiga:", value=DEFAULT_TAIGA_HOST, key="sidebar_taiga_host")
+    taiga_user = st.text_input("Usuario:", value=DEFAULT_TAIGA_USER, key="sidebar_taiga_user")
+    taiga_pass = st.text_input("Contraseña:", value=DEFAULT_TAIGA_PASS, type="password", key="sidebar_taiga_pass")
+    taiga_slug = st.text_input("Slug Proyecto:", value=DEFAULT_TAIGA_PROJECT_SLUG, key="sidebar_taiga_slug")
+
 mode = st.sidebar.radio("Navegación", [
     "📥 Robots de Descarga", 
     "🔄 Robots de Conversión", 
     "🚚 Robots de Migración",
-    # "📦 Migración por Lote"  # 
+    "🤖 AutoGenerate (Agente IA Taiga)",
+    # "📦 Migración por Lote"
 ])
 
 # ─── PESTAÑA 1: DESCARGA ───────────────────────────────────────
@@ -2077,6 +2097,348 @@ elif "Robots de Migración" in mode:
                         st.warning("El comando terminó con advertencias o error.")
                     with st.expander("Ver logs de disparo de Airflow", expanded=True):
                         st.code(trig_res_v2["output"] or "Sin salida de terminal.")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PESTAÑA 4: AUTOGENERATE (AGENTE IA TAIGA)
+# ═════════════════════════════════════════════════════════════════════════════
+elif "AutoGenerate" in mode:
+    st.header("🤖 AutoGenerate: Agente Autónomo de IA para Taiga")
+    st.caption("Lectura de requerimientos desde Taiga Kanban, descarga automática de archivos de muestra (Attachments), generación bajo estándares de `.agents/` y bucle de auto-corrección (Self-Healing).")
+
+    # Inicializar cliente Taiga
+    tc = TaigaClient(
+        host=taiga_host,
+        username=taiga_user,
+        password=taiga_pass,
+        project_slug=taiga_slug
+    )
+
+    with st.spinner("Sincronizando con Taiga Kanban..."):
+        ok_auth, msg_auth = tc.authenticate()
+        if not ok_auth:
+            st.error(f"⚠️ Error conectando a Taiga: {msg_auth}")
+            st.info("Configura tu usuario y contraseña de Taiga en el archivo `.env` o en el panel lateral.")
+            st.stop()
+
+        ok_proj, msg_proj, proj_data = tc.get_project_info()
+        if not ok_proj:
+            st.error(f"⚠️ Error cargando proyecto: {msg_proj}")
+            st.stop()
+
+    st.success(f"🟢 Conectado a Taiga: Proyecto **{tc.project_name}** (`{tc.project_slug}`)")
+
+    # Filtros de tareas
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+    with col_f1:
+        status_opts = ["Todos", "New", "In progress", "Ready for test", "Revision", "Done"]
+        sel_status = st.selectbox("Estado en Kanban:", status_opts, index=0)
+    with col_f2:
+        only_mine = st.checkbox("Solo asignadas a mí", value=False)
+    with col_f3:
+        search_kw = st.text_input("🔍 Buscar por código o palabra clave:", value="").strip()
+
+    # Cargar historias
+    stories = tc.get_user_stories(status_name=sel_status, only_assigned_to_me=only_mine)
+    if search_kw:
+        stories = [s for s in stories if search_kw.lower() in s.get("subject", "").lower()]
+
+    if not stories:
+        st.warning("No se encontraron tareas con los filtros seleccionados.")
+    else:
+        st.info(f"📊 Tareas encontradas: **{len(stories)}** (las tareas activas **New** e **In progress** aparecen ordenadas primero).")
+
+        story_options = {
+            s["ref"]: f"#{s['ref']} - [{s.get('status_extra_info', {}).get('name')}] {s.get('subject')}"
+            for s in stories
+        }
+        selected_ref = st.selectbox(
+            "Selecciona la tarea a automatizar:",
+            options=list(story_options.keys()),
+            format_func=lambda ref: story_options[ref]
+        )
+
+        # Cargar detalle completo
+        with st.spinner("Cargando requerimiento y adjuntos de Taiga..."):
+            ok_det, msg_det, story_detail = tc.get_story_detail(selected_ref)
+
+        if not ok_det:
+            st.error(f"Error cargando detalle de la tarea #{selected_ref}: {msg_det}")
+        else:
+            meta = tc.parse_story_metadata(story_detail)
+            attachments = meta.get("attachments", [])
+
+            # Tarjeta de metadatos de la tarea
+            col_m1, col_m2 = st.columns([3, 2])
+            with col_m1:
+                st.subheader(f"📋 {meta.get('subject')}")
+                tipo_badge = "🔄 CONVERSIÓN" if meta.get("task_type") == "conversion" else "📥 DESCARGA"
+                st.markdown(f"**Tipo detectado:** `{tipo_badge}` | **Código:** `{meta.get('robot_code')}`")
+                st.markdown(f"**Asignado a:** `{meta.get('assigned_to') or 'Sin asignar'}` | **Estado:** `{meta.get('status')}`")
+                if meta.get("task_type") == "conversion":
+                    st.markdown(
+                        f"- **Página:** `{meta.get('page_number')}`\n"
+                        f"- **Separador decimal:** `{meta.get('decimal_separator')}`\n"
+                        f"- **Palabras clave:** `{meta.get('key_words')}`\n"
+                        f"- **Periodicidad:** `{meta.get('periodicity')}`"
+                    )
+                else:
+                    st.markdown(
+                        f"- **Tipo Descarga:** `{meta.get('download_type')}`\n"
+                        f"- **URL:** [{meta.get('main_url')}]({meta.get('main_url')})\n"
+                        f"- **Actualizado a (ref):** `{meta.get('updated_to')}`\n"
+                        f"- **Periodicidad:** `{meta.get('periodicity')}`"
+                    )
+
+            with col_m2:
+                st.markdown("#### 📎 Adjuntos en Taiga (Attachments)")
+                if not attachments:
+                    st.info("Esta tarea no tiene archivos adjuntos en Taiga.")
+                else:
+                    for att in attachments:
+                        att_name = att.get("name", "archivo")
+                        att_size = att.get("size", 0)
+                        size_kb = round(att_size / 1024, 1) if att_size else "?"
+                        st.write(f"📄 **{att_name}** ({size_kb} KB)")
+
+                        if att_name.lower().endswith((".png", ".jpg", ".jpeg")):
+                            with st.expander(f"🖼️ Ver captura: {att_name}"):
+                                st.image(att.get("url"))
+
+            st.markdown("---")
+
+            # Manejo del Archivo Muestra para Conversión
+            sample_file_path = None
+            inspection_text = ""
+            if meta.get("task_type") == "conversion":
+                st.markdown("### 🧪 Archivo de Muestra para Conversión")
+                data_atts = [a for a in attachments if a.get("name", "").lower().endswith((".xlsx", ".xls", ".xlsm", ".pdf", ".csv"))]
+
+                tab_s1, tab_s2 = st.tabs(["📥 Descargar desde Attachments de Taiga", "📂 Subir Manualmente"])
+                with tab_s1:
+                    if data_atts:
+                        sel_att = st.selectbox(
+                            "Selecciona el archivo adjunto para analizar:",
+                            data_atts,
+                            format_func=lambda a: f"{a.get('name')} ({round((a.get('size') or 0)/1024, 1)} KB)",
+                            key=f"sel_att_{selected_ref}"
+                        )
+                        local_sample_dir = os.path.join(CURRENT_DIR, "attachtments", meta.get("robot_code") or f"story_{selected_ref}")
+                        sample_dest = os.path.join(local_sample_dir, sel_att.get("name"))
+
+                        col_datt1, col_datt2 = st.columns([2, 3])
+                        with col_datt1:
+                            if st.button("📥 Descargar Archivo Muestra al Workspace", key=f"btn_dl_att_{selected_ref}"):
+                                with st.spinner(f"Descargando {sel_att.get('name')} desde Taiga..."):
+                                    ok_dla, msg_dla = tc.download_attachment(sel_att.get("url"), sample_dest)
+                                if ok_dla:
+                                    st.success(f"Archivo descargado: `{sample_dest}`")
+                                else:
+                                    st.error(msg_dla)
+
+                        if os.path.isfile(sample_dest):
+                            sample_file_path = sample_dest
+                            st.success(f"Archivo muestra listo en: `{sample_dest}`")
+                    else:
+                        st.info("No se encontraron archivos de datos (Excel/PDF) en los adjuntos de esta tarea en Taiga. Puedes subirlo en la pestaña contigua.")
+
+                with tab_s2:
+                    up_sample = st.file_uploader("O sube un archivo muestra local (Excel o PDF):", type=["xlsx", "xls", "pdf", "csv"], key=f"up_manual_{selected_ref}")
+                    if up_sample:
+                        up_dest = os.path.join(CURRENT_DIR, "attachtments", meta.get("robot_code") or f"story_{selected_ref}", up_sample.name)
+                        os.makedirs(os.path.dirname(up_dest), exist_ok=True)
+                        with open(up_dest, "wb") as f:
+                            f.write(up_sample.getbuffer())
+                        sample_file_path = up_dest
+                        st.success(f"Muestra guardada en `{sample_file_path}`")
+
+                # Inspección de estructura y selección de hoja
+                chosen_sheet = meta.get("target_sheet", "")
+                if sample_file_path and os.path.isfile(sample_file_path):
+                    if sample_file_path.lower().endswith((".xlsx", ".xls", ".xlsm")):
+                        try:
+                            import openpyxl
+                            wb_temp = openpyxl.load_workbook(sample_file_path, read_only=True)
+                            available_sheets = wb_temp.sheetnames
+                            wb_temp.close()
+                            if available_sheets:
+                                def_idx = 0
+                                for i, sh in enumerate(available_sheets):
+                                    if chosen_sheet and (chosen_sheet.lower() in sh.lower() or sh.lower() in chosen_sheet.lower()):
+                                        def_idx = i
+                                        break
+                                    elif not chosen_sheet and i > 0 and sh.lower() not in ("inicio", "portada", "indice"):
+                                        def_idx = i
+                                        break
+                                chosen_sheet = st.selectbox(
+                                    "📑 Hoja de cálculo a procesar:",
+                                    available_sheets,
+                                    index=def_idx,
+                                    key=f"sel_sh_{selected_ref}"
+                                )
+                        except Exception:
+                            pass
+
+                    with st.expander("🔍 Inspección Quirúrgica de la Muestra (Primeras Filas / Estructura)", expanded=True):
+                        inspection_text = inspect_sample_file(sample_file_path, page_number=meta.get("page_number", 1), target_sheet=chosen_sheet)
+                        st.code(inspection_text, language="text")
+
+            with st.expander("📚 Guías Oficiales y Plantillas de Referencia (docs/ y examples/)", expanded=False):
+                g_tab1, g_tab2, g_tab3, g_tab4 = st.tabs(["📘 Guía Conversión", "📥 Guía Descarga", "✅ Checklist Calidad", "💡 Plantillas de Código"])
+                with g_tab1:
+                    st.markdown(load_doc("GUIA_ROBOTS_CONVERSION.md"))
+                with g_tab2:
+                    st.markdown(load_doc("GUIA_ROBOTS_DESCARGA.md"))
+                with g_tab3:
+                    st.markdown(load_doc("CHECKLIST_ENTREGA.md"))
+                with g_tab4:
+                    ex_choice = st.selectbox(
+                        "Seleccionar plantilla de ejemplo:",
+                        ["conversion_excel", "conversion_pdf", "download_type_i", "download_type_ii", "download_type_iii", "download_type_iv", "download_playwright"],
+                        key=f"ex_choice_{selected_ref}"
+                    )
+                    st.code(load_example(ex_choice), language="python")
+
+            st.markdown("---")
+            st.markdown("### 🤖 Generación Autónoma con Agente IA")
+
+            # Botón de lanzamiento del agente
+            btn_launch = st.button("🚀 Iniciar Agente Autónomo (Generar y Auto-Validar)", type="primary", use_container_width=True, key=f"btn_run_agent_{selected_ref}")
+
+            if f"agent_code_{selected_ref}" not in st.session_state:
+                st.session_state[f"agent_code_{selected_ref}"] = ""
+
+            if btn_launch:
+                api_key = st.session_state.get("gemini_api_key") or DEFAULT_GEMINI_API_KEY
+                if not api_key:
+                    st.error("Por favor ingresa tu clave GEMINI_API_KEY en la barra lateral o en el archivo .env.")
+                else:
+                    agent = AgentGenerator(api_key=api_key)
+                    rules_content = load_datax_rules(CURRENT_DIR)
+
+                    # Paso 1: Generación inicial
+                    with st.status("🤖 Agente IA en progreso...", expanded=True) as status_box:
+                        st.write("1. Analizando requerimientos y estándares oficiales de DATAX...")
+                        if meta.get("task_type") == "conversion":
+                            target_sh_str = chosen_sheet if 'chosen_sheet' in locals() else meta.get("target_sheet", "")
+                            st.write(f"2. Invocando IA para generar Conversión `{meta.get('robot_code')}` (Hoja: `{target_sh_str}`)...")
+                            ok_gen, code_generated = agent.generate_conversion_robot(
+                                robot_code=meta.get("robot_code"),
+                                report_name=meta.get("report_name"),
+                                page_number=meta.get("page_number", 1),
+                                decimal_separator=meta.get("decimal_separator", ","),
+                                key_words=meta.get("key_words", ""),
+                                sample_inspection=inspection_text if 'inspection_text' in locals() else "",
+                                target_sheet=target_sh_str,
+                                rules_text=rules_content
+                            )
+                        else:
+                            st.write(f"2. Invocando IA para generar Descarga `{meta.get('robot_code')}` ({meta.get('download_type')})...")
+                            ok_gen, code_generated = agent.generate_download_robot(
+                                robot_code=meta.get("robot_code"),
+                                download_type=meta.get("download_type", "Tipo I"),
+                                main_url=meta.get("main_url", ""),
+                                updated_to=meta.get("updated_to", "2024-01-01"),
+                                report_name=meta.get("report_name", ""),
+                                rules_text=rules_content
+                            )
+
+                        if not ok_gen:
+                            status_box.update(label="❌ Falla en generación con IA", state="error")
+                            st.error(f"Error del agente: {code_generated}")
+                        else:
+                            st.session_state[f"agent_code_{selected_ref}"] = code_generated
+                            st.write("3. Código inicial generado exitosamente. Iniciando validación...")
+
+                            # Paso 2: Validación y bucle de auto-corrección
+                            if meta.get("task_type") == "conversion" and sample_file_path and os.path.isfile(sample_file_path):
+                                max_heal_attempts = 3
+                                current_code = code_generated
+                                healed_ok = False
+
+                                for attempt in range(1, max_heal_attempts + 1):
+                                    st.write(f"🧪 Evaluando código (Intento {attempt}/{max_heal_attempts})...")
+                                    test_res = test_conversion_robot_code(
+                                        code_str=current_code,
+                                        robot_code=meta.get("robot_code"),
+                                        sample_file_path=sample_file_path,
+                                        key_words=meta.get("key_words", ""),
+                                        page_number=meta.get("page_number", 1),
+                                        decimal_separator=meta.get("decimal_separator", ",")
+                                    )
+
+                                    if test_res["success"]:
+                                        st.write(f"✅ ¡Validación exitosa! {test_res.get('total_rows')} filas extraídas y reconciliación contable exacta.")
+                                        healed_ok = True
+                                        status_box.update(label="🎯 ¡Robot Generado y Validado con Éxito!", state="complete")
+                                        break
+                                    else:
+                                        err_msg = test_res.get("error", "Error desconocido")
+                                        st.write(f"⚠️ Intento {attempt} falló: `{test_res.get('stage')}` -> {err_msg[:140]}...")
+                                        if attempt < max_heal_attempts:
+                                            st.write("🔁 El Agente IA está auto-corrigiendo el código según el error...")
+                                            ok_heal, healed_code = agent.heal_robot_code(
+                                                current_code=current_code,
+                                                error_message=err_msg,
+                                                robot_code=meta.get("robot_code"),
+                                                task_type="conversion"
+                                            )
+                                            if ok_heal:
+                                                current_code = healed_code
+                                            else:
+                                                st.error(f"Falla en la auto-curación: {healed_code}")
+                                                break
+
+                                st.session_state[f"agent_code_{selected_ref}"] = current_code
+                                if not healed_ok:
+                                    status_box.update(label="⚠️ Requiere revisión manual", state="error")
+                                    st.warning("El agente generó el código pero la prueba aún presenta discrepancias. Puedes revisar o ajustar el código abajo.")
+
+                            elif meta.get("task_type") == "download":
+                                st.write("🧪 Verificando métodos y estructura del robot de descarga...")
+                                dl_test = validate_download_robot_structure(code_generated, meta.get("robot_code"), meta.get("download_type", "Tipo I"))
+                                if dl_test["success"]:
+                                    status_box.update(label="🎯 ¡Estructura de Robot de Descarga Verificada!", state="complete")
+                                    st.write(f"✅ Métodos validados: `{dl_test.get('methods')}`")
+                                else:
+                                    status_box.update(label="⚠️ Estructura incompleta", state="error")
+                                    st.warning(f"Advertencia: {dl_test.get('error')}")
+                            else:
+                                status_box.update(label="✅ Robot Generado (Sin muestra local para probar)", state="complete")
+
+            # Sección de Editor / Guardado de código generado
+            if st.session_state.get(f"agent_code_{selected_ref}"):
+                st.markdown("### 💻 Código Generado por el Agente (`robot.py`)")
+                code_editor_val = st.text_area(
+                    "Revisa o edita el código antes de guardar:",
+                    value=st.session_state[f"agent_code_{selected_ref}"],
+                    height=420,
+                    key=f"editor_code_{selected_ref}"
+                )
+
+                # Deducir ruta de guardado en V2
+                r_code = meta.get("robot_code") or f"robot_{selected_ref}"
+                if meta.get("task_type") == "conversion":
+                    fam_code = r_code.replace("D_", "C_").rsplit("_", 1)[0] if "_" in r_code else r_code
+                    suggested_dest = os.path.join(new_repo, "models", "conversion", fam_code, f"{r_code}.py")
+                else:
+                    suggested_dest = os.path.join(new_repo, "models", "download", r_code, f"{r_code}.py")
+
+                col_sv1, col_sv2 = st.columns([2, 3])
+                with col_sv1:
+                    dest_input = st.text_input("Ruta de destino en V2:", value=suggested_dest, key=f"dest_inp_{selected_ref}")
+                with col_sv2:
+                    st.write("")
+                    st.write("")
+                    if st.button(f"💾 Guardar `{r_code}.py` en Repositorio V2", type="primary", key=f"btn_save_v2_{selected_ref}"):
+                        try:
+                            os.makedirs(os.path.dirname(dest_input), exist_ok=True)
+                            with open(dest_input, "w", encoding="utf-8") as f:
+                                f.write(code_editor_val)
+                            st.success(f"✨ ¡Robot guardado exitosamente en `{dest_input}`!")
+                            st.info("👉 Ya puedes dirigirte al módulo de Conversión o Descarga para realizar el despliegue al servidor o disparar el DAG en Airflow.")
+                        except Exception as exc:
+                            st.error(f"Error al guardar archivo: {exc}")
+
 
 # elif "Migración por Lote" in mode:
 #     st.header("📊 Migración Masiva por Lote (Batch)")
