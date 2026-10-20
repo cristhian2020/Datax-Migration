@@ -1606,7 +1606,9 @@ elif "Robots de Migración" in mode:
             st.caption(f"ℹ️ Archivo SQLite detectado: `{sqlite_file}`")
 
         report_db_name = db_mig_info.get("name", "") if db_mig_info else ""
-        struct = inspect_sqlite_structure(sqlite_file, sel_report, extra_text=report_db_name)
+        use_offline_key = f"use_offline_analysis_{sel_report}"
+        use_offline = st.session_state.get(use_offline_key, False)
+        struct = inspect_sqlite_structure(sqlite_file, sel_report, extra_text=report_db_name, run_heuristic=use_offline)
         
         tab_cfg, tab_preview, tab_deploy = st.tabs([
             "⚙️ 1. Configuración & Estructura",
@@ -1615,6 +1617,52 @@ elif "Robots de Migración" in mode:
         ])
 
         with tab_cfg:
+            # ─── MODO DE ANÁLISIS: PREGUNTAR POR ANÁLISIS DE RESPALDO OFFLINE ─────
+            st.markdown("#### ⚡ Análisis Heurístico de Respaldo (Offline)")
+            if not use_offline:
+                st.markdown(
+                    """
+                    <div style="background: rgba(30, 41, 59, 0.7); border: 1px solid #3b82f6; border-left: 5px solid #3b82f6; border-radius: 8px; padding: 12px 16px; margin: 4px 0 12px 0;">
+                        <div style="font-weight: 600; color: #60a5fa; font-size: 0.95rem; margin-bottom: 2px;">
+                            ❓ ¿Deseas ejecutar el Análisis de Respaldo Offline?
+                        </div>
+                        <div style="color: #cbd5e1; font-size: 0.85rem;">
+                            Por defecto se encuentra en <b>Modo Manual</b> (sin auto-clasificación). Puedes ejecutar el análisis heurístico local para sugerir automáticamente métricas, unidades, factores y hechos mixtos.
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                col_off1, col_off2 = st.columns([1, 1])
+                with col_off1:
+                    if st.button("⚡ Sí, ejecutar con Análisis de Respaldo Offline", key=f"btn_run_offline_{sel_report}", type="primary", use_container_width=True):
+                        st.session_state[use_offline_key] = True
+                        for k in [f"metric_{sel_report}", f"unit_{sel_report}", f"factor_{sel_report}", f"cb_mixed_{sel_report}"]:
+                            st.session_state.pop(k, None)
+                        st.rerun()
+                with col_off2:
+                    st.info("✋ Configuración manual activa: el análisis automático no se ejecutará.")
+            else:
+                st.markdown(
+                    """
+                    <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid #10b981; border-left: 5px solid #10b981; border-radius: 8px; padding: 10px 16px; margin: 4px 0 12px 0;">
+                        <div style="color: #34d399; font-weight: 600; font-size: 0.95rem;">
+                            🟢 Análisis de Respaldo Offline ACTIVO
+                        </div>
+                        <div style="color: #cbd5e1; font-size: 0.85rem; margin-top: 2px;">
+                            Se aplicaron las sugerencias y clasificaciones del motor heurístico local.
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                if st.button("↩️ Quitar Análisis de Respaldo (Volver a Modo Manual)", key=f"btn_reset_offline_{sel_report}", use_container_width=True):
+                    st.session_state[use_offline_key] = False
+                    for k in [f"metric_{sel_report}", f"unit_{sel_report}", f"factor_{sel_report}", f"cb_mixed_{sel_report}", f"agent_res_{sel_report}"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+            st.markdown("---")
             st.markdown("#### 🤖 Agente Analizador Inteligente de SQLite (Gemini / Heurístico)")
             st.caption("El Agente examina títulos, jerarquías multinivel, categorías únicas y la distribución numérica en SQLite para clasificar exactamente métricas homogéneas o mixtas (tasa, moneda, %, BOB, USD, UFV) y el factor de conversión correspondiente.")
 
