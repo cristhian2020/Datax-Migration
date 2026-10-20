@@ -92,8 +92,8 @@ def get_migration_db_info(report_code: str, engine) -> Optional[Dict]:
         return None
 
 
-def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text: str = "") -> Dict:
-    """Inspecciona la tabla SQLite para obtener columnas, muestras y sugerir metricas y unidades."""
+def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text: str = "", run_heuristic: bool = False) -> Dict:
+    """Inspecciona la tabla SQLite para obtener columnas, muestras y opcionalmente sugerir metricas y unidades mediante analisis heuristico."""
     with sqlite3.connect(sqlite_path) as conn:
         cursor = conn.cursor()
         if not table_name:
@@ -117,6 +117,26 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
             vals = df[t_col].dropna().astype(str).tolist()
             if vals:
                 combined_titles += " " + " ".join(vals)
+
+    if not run_heuristic:
+        return {
+            "all_columns": cols_clean,
+            "title_cols": title_cols,
+            "nv_cols": nv_cols,
+            "aux_cols": aux_cols,
+            "suggested_metric": "moneda",
+            "suggested_unit": "BOB",
+            "suggested_factor": 1.0,
+            "has_mixed_rows": False,
+            "has_multi_currency": False,
+            "has_multiple_facts": False,
+            "detected_facts": [],
+            "detected_currencies": [],
+            "titles_text": combined_titles.strip(),
+            "sample_df": df,
+            "heuristic_executed": False
+        }
+
     combined_titles_lower = combined_titles.lower()
 
     nv1_sample = " ".join(df["nv1"].dropna().head(10).astype(str)).lower() if "nv1" in df.columns else ""
@@ -429,7 +449,8 @@ def inspect_sqlite_structure(sqlite_path: str, table_name: str = "", extra_text:
         "detected_facts": detected_facts,
         "detected_currencies": sorted(list(detected_currencies)),
         "titles_text": combined_titles.strip(),
-        "sample_df": df
+        "sample_df": df,
+        "heuristic_executed": True
     }
 
 

@@ -34,5 +34,11 @@ DEFAULT_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# Taiga Kanban
+DEFAULT_TAIGA_HOST = os.getenv("TAIGA_HOST", "https://investigaciontaiga.datax.com.bo")
+DEFAULT_TAIGA_USER = os.getenv("TAIGA_USER", "")
+DEFAULT_TAIGA_PASS = os.getenv("TAIGA_PASS", "")
+DEFAULT_TAIGA_PROJECT_SLUG = os.getenv("TAIGA_PROJECT_SLUG", "procesamiento-de-archivos-2")
+
 def get_engine(host=DEFAULT_DB_HOST, port=DEFAULT_DB_PORT, user=DEFAULT_DB_USER, password=DEFAULT_DB_PASS, database=DEFAULT_DB_NAME):
     return create_engine(f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}")
